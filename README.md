@@ -13,21 +13,32 @@ It is cross-platform and runs faster than all known open-source frameworks on mo
 Developers can easily deploy deep learning algorithm models to the mobile platform by using efficient ncnn implementation, creating intelligent APPs, and bringing artificial intelligence to your fingertips.
 ncnn is currently being used in many Tencent applications, such as QQ, Qzone, WeChat, Pitu, and so on.
 
-ncnn 是一个为手机端极致优化的高性能神经网络前向计算框架。
-ncnn 从设计之初深刻考虑手机端的部署和使用。
-无第三方依赖，跨平台，手机端 cpu 的速度快于目前所有已知的开源框架。
-基于 ncnn，开发者能够将深度学习算法轻松移植到手机端高效执行，
-开发出人工智能 APP，将 AI 带到你的指尖。
-ncnn 目前已在腾讯多款应用中使用，如：QQ，Qzone，微信，天天 P 图等。
+## K1X / BPI-F3 YOLO11 Deterministic Harness
+
+This repository includes a deterministic YOLO11n forward-only harness for SpacemiT K1X (BPI-F3).
+
+- In-code CPU affinity (sched_setaffinity + pthread_setaffinity_np) pinned to cluster0 via L2 shared_cpu_list
+- Strict OpenMP environment hygiene (--strict-omp-env)
+- Robust model path flags (--model-dir/--model-name or --param/--bin)
+- Bench-only and quiet modes for clean timing output
+
+Baseline (cluster0, threads=4, warmup=10, runs=100, repeats=5, bench-only, no-gui):
+- Mean 555260.35 us, stddev 1330.42 us (~1.80 FPS), harness v0003
+
+One-line reproducible command (no cd required):
+
+```
+/home/svt/ncnn/build-riscv/examples/yolo11 /home/svt/ncnn/build-riscv/examples/photo_2024-10-11_10-04-04.jpg --model-dir /home/svt/ncnn/models --model-name yolo11n --bench-only --pin cluster0 --threads 4 --repeats 5 --warmup 10 --runs 100 --no-gui --strict-omp-env 1 --quiet
+```
 
 ---
 
 <table>
 <tr>
 <td>
-<b>技术交流 QQ 群</b><br />
-637093648 (超多大佬)<br />
-答案：卷卷卷卷卷（已满）
+<b>Tech Exchange QQ Group</b><br />
+637093648 (large community)<br />
+Answer: juan-juan-juan-juan-juan (full)
 </td>
 <td rowspan=3>
 <b>Telegram Group</b>
@@ -42,15 +53,15 @@ ncnn 目前已在腾讯多款应用中使用，如：QQ，Qzone，微信，天�
 </tr>
 <tr>
 <td>
-<b>Pocky QQ 群（MLIR YES!）</b><br />
-677104663 (超多大佬)<br />
-答案：multi-level intermediate representation
+<b>Pocky QQ Group (MLIR YES!)</b><br />
+677104663 (large community)<br />
+Answer: multi-level intermediate representation
 </td>
 </tr>
 <tr>
 <td>
-<b>他们都不知道 pnnx 有多好用群</b><br />
-818998520 (新群！)
+<b>PNNX Is More Useful Than They Think QQ Group</b><br />
+818998520 (new group!)
 </td>
 </tr>
 </table>
@@ -493,8 +504,6 @@ https://github.com/Tencent/ncnn/releases/latest
 
 ## Support most commonly used CNN network
 
-## 支持大部分常用的 CNN 网络
-
 - Classical CNN:
   [VGG](https://github.com/BVLC/caffe/wiki/Model-Zoo#models-used-by-the-vgg-team-in-ilsvrc-2014)
   [AlexNet](https://github.com/BVLC/caffe/tree/9b891540183ddc834a02b2bd81b31afae71b2153/models/bvlc_alexnet)
@@ -559,8 +568,6 @@ https://github.com/Tencent/ncnn/releases/latest
 
 **[use ncnn with alexnet](https://github.com/Tencent/ncnn/wiki/use-ncnn-with-alexnet) with detailed steps, recommended for beginners :)**
 
-**[ncnn 组件使用指北 alexnet](https://github.com/Tencent/ncnn/wiki/use-ncnn-with-alexnet.zh) 附带详细步骤，新人强烈推荐 :)**
-
 **[use netron for ncnn model visualization](https://netron.app)**
 
 **[use ncnn with pytorch or onnx](https://github.com/Tencent/ncnn/wiki/use-ncnn-with-pytorch-or-onnx)**
@@ -599,23 +606,8 @@ https://github.com/Tencent/ncnn/releases/latest
 - Extensible model design, supports 8bit quantization and half-precision floating point storage, can import caffe/pytorch/mxnet/onnx/darknet/keras/tensorflow(mlir) models
 - Support direct memory zero copy reference load network model
 - Can be registered with custom layer implementation and extended
-- Well, it is strong, not afraid of being stuffed with 卷 QvQ
+- Well, it is strong and not afraid of heavy workloads QvQ
 
-## 功能概述
-
-- 支持卷积神经网络，支持多输入和多分支结构，可计算部分分支
-- 无任何第三方库依赖，不依赖 BLAS/NNPACK 等计算框架
-- 纯 C++ 实现，跨平台，支持 Android / iOS 等
-- ARM Neon 汇编级良心优化，计算速度极快
-- 精细的内存管理和数据结构设计，内存占用极低
-- 支持多核并行计算加速，ARM big.LITTLE CPU 调度优化
-- 支持基于全新低消耗的 Vulkan API GPU 加速
-- 可扩展的模型设计，支持 8bit [量化](tools/quantize) 和半精度浮点存储，可导入 caffe/pytorch/mxnet/onnx/darknet/keras/tensorflow(mlir) 模型
-- 支持直接内存零拷贝引用加载网络模型
-- 可注册自定义层实现并扩展
-- 恩，很强就是了，不怕被塞卷 QvQ
-
----
 
 ## supported platform matrix
 

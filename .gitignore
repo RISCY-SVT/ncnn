@@ -1,6 +1,13 @@
 # CMake build directory
 build*/
 
+# Local artifacts
+models/
+ncnn-logs/
+*.log
+examples/photo_2024-10-11_10-04-04.jpg
+photo_2024-10-11_10-04-04.jpg
+
 # Backup files.
 *~
 
