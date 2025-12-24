@@ -287,7 +287,8 @@ int Padding_riscv::forward_bf16s_fp16s(const Mat& bottom_blob, Mat& top_blob, co
 
                 // clang-format off
                 // *INDENT-OFF*
-                vuint16m1_t pad_value;
+                // Initialize pad_value defensively in case no fp16/bf16 path overrides it.
+                vuint16m1_t pad_value = __riscv_vmv_v_x_u16m1(0, vl);
 #if NCNN_ZFH
                 if (opt.use_fp16_storage)
                 {
@@ -328,7 +329,8 @@ int Padding_riscv::forward_bf16s_fp16s(const Mat& bottom_blob, Mat& top_blob, co
 
                 // clang-format off
                 // *INDENT-OFF*
-                vuint16m1_t pad_value;
+                // Initialize pad_value defensively in case no fp16/bf16 path overrides it.
+                vuint16m1_t pad_value = __riscv_vmv_v_x_u16m1(0, vl);
 #if NCNN_ZFH
                 if (opt.use_fp16_storage)
                 {
@@ -376,7 +378,8 @@ int Padding_riscv::forward_bf16s_fp16s(const Mat& bottom_blob, Mat& top_blob, co
 
                     // clang-format off
                     // *INDENT-OFF*
-                    vuint16m1_t pad_value;
+                    // Initialize pad_value defensively in case no fp16/bf16 path overrides it.
+                    vuint16m1_t pad_value = __riscv_vmv_v_x_u16m1(0, vl);
 #if NCNN_ZFH
                     if (opt.use_fp16_storage)
                     {
@@ -434,7 +437,8 @@ int Padding_riscv::forward_bf16s_fp16s(const Mat& bottom_blob, Mat& top_blob, co
                 {
                     // clang-format off
                     // *INDENT-OFF*
-                    vuint16m1_t pad_value;
+                    // Initialize pad_value defensively in case no fp16/bf16 path overrides it.
+                    vuint16m1_t pad_value = __riscv_vmv_v_x_u16m1(0, vl);
 #if NCNN_ZFH
                     if (opt.use_fp16_storage)
                     {

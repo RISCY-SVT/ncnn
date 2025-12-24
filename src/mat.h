@@ -30,6 +30,16 @@
 #include "option.h"
 #include "platform.h"
 
+#if defined(__riscv) && !defined(NCNN_RISCV_FP16_DEFINED)
+// RISC-V toolchains may lack __fp16; provide an alias to _Float16 when ZFH/ZVFH is enabled.
+#if (defined(__riscv_zfh) || defined(__riscv_zfhmin) || defined(__riscv_zvfh) || defined(__riscv_zvfhmin)) && !defined(__fp16)
+#ifndef __FP16_TYPE__
+typedef _Float16 __fp16;
+#endif
+#define NCNN_RISCV_FP16_DEFINED 1
+#endif
+#endif
+
 #if NCNN_PIXEL
 #if NCNN_PLATFORM_API
 #if __ANDROID_API__ >= 9
