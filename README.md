@@ -21,6 +21,7 @@ This repository includes a deterministic YOLO11n forward-only harness for Spacem
 - Strict OpenMP environment hygiene (--strict-omp-env)
 - Robust model path flags (--model-dir/--model-name or --param/--bin)
 - Bench-only and quiet modes for clean timing output
+- K1X notes and helpers: docs/k1x/NCNN_FP16_RISCV_NOTES.md, docs/k1x/YOLO_NCNN_NOTES.md, tools/k1x/convert_yolo_to_ncnn.py, tools/k1x/rsync_csi_to_bananaK1.sh
 
 Baseline (cluster0, threads=4, warmup=10, runs=100, repeats=5, bench-only, no-gui):
 - Mean 555260.35 us, stddev 1330.42 us (~1.80 FPS), harness v0003
@@ -28,7 +29,7 @@ Baseline (cluster0, threads=4, warmup=10, runs=100, repeats=5, bench-only, no-gu
 One-line reproducible command (no cd required):
 
 ```
-/home/svt/ncnn/build-riscv/examples/yolo11 /home/svt/ncnn/build-riscv/examples/photo_2024-10-11_10-04-04.jpg --model-dir /home/svt/ncnn/models --model-name yolo11n --bench-only --pin cluster0 --threads 4 --repeats 5 --warmup 10 --runs 100 --no-gui --strict-omp-env 1 --quiet
+/path/to/ncnn/build-riscv/examples/yolo11 /path/to/test.jpg --model-dir /path/to/ncnn/models --model-name yolo11n --bench-only --pin cluster0 --threads 4 --repeats 5 --warmup 10 --runs 100 --no-gui --strict-omp-env 1 --quiet
 ```
 
 ---
