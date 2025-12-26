@@ -3,6 +3,9 @@ build*/
 
 # Local artifacts
 models/
+models-int8/
+tmp_int8_work/
+tmp_int8_dbg/
 ncnn-logs/
 *.log
 examples/photo_2024-10-11_10-04-04.jpg

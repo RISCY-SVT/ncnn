@@ -59,7 +59,8 @@ void Mat::clone_from(const ncnn::Mat& mat, Allocator* allocator)
 
 Mat Mat::reshape(int _w, Allocator* _allocator) const
 {
-    if (w * h * d * c != _w)
+    size_t total = (size_t)w * h * d * c;
+    if ((size_t)_w != total)
         return Mat();
 
     if (dims >= 3 && cstep != (size_t)w * h * d)
