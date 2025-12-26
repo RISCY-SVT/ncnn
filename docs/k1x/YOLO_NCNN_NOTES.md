@@ -28,5 +28,46 @@
 - `python tools/k1x/convert_yolo_to_ncnn.py yolo11n` → used Ultralytics direct NCNN export; produced `models/yolo11n.ncnn.param/bin`, verified with `ncnn.Net`.
 - On Banana Pi BPI-F3, running the example with a local test image (e.g., `/path/to/image.jpg`) logs `out0 shape: w=8400 h=84 c=1` and renders detections. Use the deterministic harness for timing.
 
+## INT8 workflow (K1X)
+### Host quantization (x86_64)
+```
+cmake -G "Unix Makefiles" -DCMAKE_BUILD_TYPE=Release -DNCNN_BUILD_TOOLS=ON -DNCNN_BUILD_EXAMPLES=OFF -DNCNN_VULKAN=OFF -S /data/ncnn -B /data/ncnn/build-host-tools
+cmake --build /data/ncnn/build-host-tools --target ncnn2table ncnn2int8
+
+python3 tools/k1x/convert_yolo_to_ncnn.py \
+  --for-example yolo11 \
+  --output-dir ./models-int8 \
+  --work-dir ./tmp_int8_work \
+  --imgsz 640 \
+  --int8 1 \
+  --calib-dir /data/opencv \
+  --calib-count 200 \
+  --int8-method kl \
+  --calib-threads 8 \
+  --force
+```
+
+### Board runs (Banana Pi BPI-F3)
+```
+export LD_LIBRARY_PATH=/home/svt/opencv-install-k1x-gtk3/lib:${LD_LIBRARY_PATH:-}
+unset OMP_NUM_THREADS OMP_PROC_BIND OMP_PLACES OMP_SCHEDULE OMP_DYNAMIC OMP_WAIT_POLICY \
+  OMP_MAX_ACTIVE_LEVELS OMP_NESTED OMP_STACKSIZE OMP_CANCELLATION OMP_DISPLAY_ENV
+unset GOMP_CPU_AFFINITY GOMP_STACKSIZE GOMP_SPINCOUNT
+
+# FP16 baseline
+/home/svt/ncnn-k1x-int8-smoke/bin/yolo11_fp16 \
+  --param /home/svt/ncnn-k1x-int8-smoke/models/yolo11n.ncnn.param \
+  --bin /home/svt/ncnn-k1x-int8-smoke/models/yolo11n.ncnn.bin \
+  --image /home/svt/ncnn-k1x-int8-smoke/models/photo_2024-10-11_10-04-04.jpg \
+  --bench-only --pin cluster0 --threads 4 --warmup 10 --runs 100 --repeats 5 --strict-omp-env 1 --quiet --no-gui
+
+# INT8
+/home/svt/ncnn-k1x-int8-smoke/bin/yolo11_int8 \
+  --param /home/svt/ncnn-k1x-int8-smoke/models/yolo11n-int8.ncnn.param \
+  --bin /home/svt/ncnn-k1x-int8-smoke/models/yolo11n-int8.ncnn.bin \
+  --image /home/svt/ncnn-k1x-int8-smoke/models/photo_2024-10-11_10-04-04.jpg \
+  --bench-only --pin cluster0 --threads 4 --warmup 10 --runs 100 --repeats 5 --strict-omp-env 1 --quiet --no-gui
+```
+
 ## Performance note (historical)
 - Early GUI runs were noisy and included I/O and post-processing. Use the deterministic forward-only harness for benchmark numbers.
