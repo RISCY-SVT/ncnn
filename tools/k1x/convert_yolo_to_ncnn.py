@@ -26,6 +26,7 @@ import subprocess
 import shutil
 import re
 import argparse
+import math
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 
@@ -93,15 +94,34 @@ class YOLOConverter:
         weights_path: Optional[str] = None,
         imgsz: Optional[str] = None,
         input_shapes_override: Optional[List[str]] = None,
-        work_dir: Optional[str] = None
+        work_dir: Optional[str] = None,
+        int8: bool = False,
+        calib_dir: Optional[str] = None,
+        imagelist: Optional[str] = None,
+        calib_count: int = 200,
+        int8_method: str = 'kl',
+        calib_threads: int = 8,
+        force_int8: bool = False,
+        ncnn2table_path: Optional[str] = None,
+        ncnn2int8_path: Optional[str] = None
     ):
         self.model_name = model_name
-        self.output_dir = Path(output_dir)
+        self.output_dir = Path(output_dir).expanduser().resolve()
         self.verbose = verbose
-        self.work_dir = Path(work_dir) if work_dir else Path('./ncnn_conversion_temp')
+        self.work_dir = (Path(work_dir).expanduser() if work_dir else Path('./ncnn_conversion_temp')).resolve()
         self.output_base_override = output_base_override
         self.weights_path = Path(weights_path).expanduser().resolve() if weights_path else None
         self.imgsz = imgsz
+        self.enable_int8 = bool(int8)
+        self.calib_dir = Path(calib_dir).expanduser().resolve() if calib_dir else None
+        self.imagelist = Path(imagelist).expanduser().resolve() if imagelist else None
+        self.calib_count = calib_count
+        self.int8_method = int8_method.lower() if int8_method else 'kl'
+        self.calib_threads = calib_threads
+        self.force_int8 = force_int8
+        self.ncnn2table_path = Path(ncnn2table_path).expanduser().resolve() if ncnn2table_path else None
+        self.ncnn2int8_path = Path(ncnn2int8_path).expanduser().resolve() if ncnn2int8_path else None
+        self.repo_root = Path(__file__).resolve().parents[2]
         
         # Parse model name
         self.base_name, self.model_type, self.model_family = self._parse_model_name()
@@ -640,6 +660,228 @@ class YOLOConverter:
         
         self.log("Conversion verified successfully", 'SUCCESS')
         return True
+
+    def _infer_imgsz(self) -> int:
+        if not self.imgsz:
+            return 640
+        text = str(self.imgsz).strip()
+        if not text:
+            return 640
+        for sep in (',', 'x', 'X'):
+            if sep in text:
+                text = text.split(sep)[0]
+                break
+        try:
+            value = int(float(text))
+            return value if value > 0 else 640
+        except ValueError:
+            return 640
+
+    def _resolve_tool(self, name: str, override: Optional[Path], extra_candidates: List[Path]) -> Optional[str]:
+        if override:
+            if override.exists():
+                return str(override)
+            self.log(f"Requested tool not found: {override}", 'ERROR')
+            return None
+        which = shutil.which(name)
+        if which:
+            return which
+        for candidate in extra_candidates:
+            if candidate.exists():
+                return str(candidate)
+        self.log(f"Required tool not found: {name}", 'ERROR')
+        return None
+
+    def _prepare_imagelist(self) -> Optional[Path]:
+        if self.imagelist:
+            if not self.imagelist.exists():
+                self.log(f"Imagelist not found: {self.imagelist}", 'ERROR')
+                return None
+            return self.imagelist.resolve()
+
+        if not self.calib_dir:
+            self.log("INT8 requires --calib-dir or --imagelist", 'ERROR')
+            return None
+        if not self.calib_dir.exists():
+            self.log(f"Calibration dir not found: {self.calib_dir}", 'ERROR')
+            return None
+        if self.calib_count <= 0:
+            self.log("calib-count must be > 0", 'ERROR')
+            return None
+
+        exts = {'.jpg', '.jpeg', '.png', '.bmp'}
+        images = [p.resolve() for p in self.calib_dir.rglob('*') if p.suffix.lower() in exts]
+        images = sorted(images, key=lambda p: str(p))
+        if not images:
+            self.log(f"No calibration images found in {self.calib_dir}", 'ERROR')
+            return None
+        images = images[: self.calib_count]
+
+        imagelist = (self.work_dir / "imagelist.txt").resolve()
+        with open(imagelist, 'w') as f:
+            for path in images:
+                f.write(f"{path}\n")
+
+        self.log(f"Calibration images: {len(images)}", 'INFO')
+        self.log(f"Imagelist saved to: {imagelist}", 'INFO')
+        return imagelist
+
+    def _sanitize_int8_table(self, table_file: Path) -> bool:
+        try:
+            lines = table_file.read_text().splitlines()
+        except Exception as e:
+            self.log(f"Failed to read table file: {e}", 'ERROR')
+            return False
+
+        changed = False
+        replaced = 0
+        sanitized_lines = []
+        for line in lines:
+            tokens = line.strip().split()
+            if len(tokens) <= 1:
+                sanitized_lines.append(line)
+                continue
+
+            max_finite = None
+            for token in tokens[1:]:
+                try:
+                    value = float(token)
+                except ValueError:
+                    continue
+                if math.isfinite(value):
+                    max_finite = value if max_finite is None else max(max_finite, abs(value))
+
+            if max_finite is None:
+                max_finite = 1.0
+
+            new_tokens = [tokens[0]]
+            for token in tokens[1:]:
+                try:
+                    value = float(token)
+                except ValueError:
+                    value = float('nan')
+
+                if math.isfinite(value):
+                    new_tokens.append(token)
+                else:
+                    new_tokens.append(f"{max_finite:.6f}")
+                    changed = True
+                    replaced += 1
+
+            sanitized_lines.append(" ".join(new_tokens))
+
+        if changed:
+            table_file.write_text("\n".join(sanitized_lines) + "\n")
+            self.log(f"Sanitized {replaced} non-finite scale values in {table_file}", 'WARNING')
+
+        return True
+
+    def quantize_int8(self) -> bool:
+        if not self.enable_int8:
+            return True
+
+        self.log("Starting INT8 quantization...", 'INFO')
+
+        if self.calib_threads <= 0:
+            self.log("calib-threads must be > 0", 'ERROR')
+            return False
+        if self.int8_method not in ('kl', 'aciq'):
+            self.log(f"Unsupported int8 method: {self.int8_method}", 'ERROR')
+            return False
+
+        imagelist = self._prepare_imagelist()
+        if imagelist is None:
+            return False
+        imagelist = imagelist.resolve()
+
+        ncnn2table = self._resolve_tool(
+            'ncnn2table',
+            self.ncnn2table_path,
+            [self.repo_root / 'build-host-tools/tools/quantize/ncnn2table']
+        )
+        ncnn2int8 = self._resolve_tool(
+            'ncnn2int8',
+            self.ncnn2int8_path,
+            [self.repo_root / 'build-host-tools/tools/quantize/ncnn2int8']
+        )
+        if not ncnn2table or not ncnn2int8:
+            return False
+
+        output_base = self.output_base
+        param_file = (self.output_dir / f"{output_base}.ncnn.param").resolve()
+        bin_file = (self.output_dir / f"{output_base}.ncnn.bin").resolve()
+        if not param_file.exists() or not bin_file.exists():
+            self.log(f"Base model files not found: {param_file} {bin_file}", 'ERROR')
+            return False
+
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        out_param = (self.output_dir / f"{output_base}-int8.ncnn.param").resolve()
+        out_bin = (self.output_dir / f"{output_base}-int8.ncnn.bin").resolve()
+        if (out_param.exists() or out_bin.exists()) and not self.force_int8:
+            self.log(f"INT8 outputs already exist: {out_param} {out_bin}", 'ERROR')
+            self.log("Use --force to overwrite existing INT8 outputs", 'ERROR')
+            return False
+        if self.force_int8:
+            for path in (out_param, out_bin):
+                if path.exists():
+                    path.unlink()
+
+        table_file = (self.work_dir / f"{output_base}-int8.table").resolve()
+        if table_file.exists():
+            table_file.unlink()
+
+        norm_val = 1.0 / 255.0
+        norm_str = f"{norm_val:.10f}"
+        shape_size = self._infer_imgsz()
+
+        cmd = [
+            ncnn2table,
+            str(param_file),
+            str(bin_file),
+            str(imagelist),
+            str(table_file),
+            "mean=[0,0,0]",
+            f"norm=[{norm_str},{norm_str},{norm_str}]",
+            f"shape=[{shape_size},{shape_size},3]",
+            "pixel=RGB",
+            f"thread={self.calib_threads}",
+            f"method={self.int8_method}",
+        ]
+        success, _ = self.run_command(cmd, "Generating calibration table (ncnn2table)")
+        if not success:
+            return False
+        if not self._sanitize_int8_table(table_file):
+            return False
+
+        cmd = [
+            ncnn2int8,
+            str(param_file),
+            str(bin_file),
+            str(out_param),
+            str(out_bin),
+            str(table_file),
+        ]
+        success, _ = self.run_command(cmd, "Quantizing model to INT8 (ncnn2int8)", check=False)
+        if not success and not (out_param.exists() and out_bin.exists()):
+            return False
+        if not success:
+            self.log("ncnn2int8 returned non-zero but outputs exist; continuing", 'WARNING')
+
+        if not out_param.exists() or not out_bin.exists():
+            self.log("INT8 outputs not found after quantization", 'ERROR')
+            return False
+
+        base_size = bin_file.stat().st_size
+        int8_size = out_bin.stat().st_size
+        self.log(f"Base bin size: {base_size} bytes", 'INFO')
+        self.log(f"INT8 bin size: {int8_size} bytes", 'INFO')
+        if int8_size >= base_size:
+            self.log("INT8 bin is not smaller than base bin", 'WARNING')
+
+        self.log("INT8 outputs created:", 'SUCCESS')
+        self.log(f"  {out_param}", 'SUCCESS')
+        self.log(f"  {out_bin}", 'SUCCESS')
+        return True
     
     def cleanup(self, keep_intermediate: bool = False):
         """Clean up temporary files"""
@@ -674,7 +916,9 @@ class YOLOConverter:
 
             # Step 3: Try direct NCNN export for supported combos
             direct_supported = self.model_family == 'yolo11' and self.model_type == 'detect'
-            if direct_supported:
+            if direct_supported and self.enable_int8:
+                self.log("INT8 enabled; skipping direct export and using PNNX pipeline", 'INFO')
+            if direct_supported and not self.enable_int8:
                 direct_outputs = self.export_direct_ncnn()
                 if direct_outputs:
                     if not self.rename_output_files(src_param=direct_outputs[0], src_bin=direct_outputs[1]):
@@ -682,6 +926,10 @@ class YOLOConverter:
                     
                     if not self.verify_conversion():
                         self.log("Verification failed after direct export, but files were created", 'WARNING')
+
+                    if self.enable_int8:
+                        if not self.quantize_int8():
+                            return False
                     
                     self.log(f"Conversion of {self.model_name} completed successfully!", 'SUCCESS')
                     return True
@@ -725,6 +973,10 @@ class YOLOConverter:
             # Step 10: Verify conversion
             if not self.verify_conversion():
                 self.log("Verification failed, but files were created", 'WARNING')
+
+            if self.enable_int8:
+                if not self.quantize_int8():
+                    return False
             
             self.log(f"Conversion of {self.model_name} completed successfully!", 'SUCCESS')
             return True
@@ -806,6 +1058,51 @@ Examples:
         default='./ncnn_conversion_temp',
         help='Temporary working directory (default: ./ncnn_conversion_temp)'
     )
+
+    parser.add_argument(
+        '--int8',
+        type=int,
+        choices=[0, 1],
+        default=0,
+        help='Enable INT8 quantization (0/1, default: 0)'
+    )
+
+    calib_group = parser.add_mutually_exclusive_group()
+    calib_group.add_argument(
+        '--calib-dir',
+        help='Directory of calibration images (optional; used for --int8)'
+    )
+    calib_group.add_argument(
+        '--imagelist',
+        help='Path to calibration imagelist file (optional; used for --int8)'
+    )
+
+    parser.add_argument(
+        '--calib-count',
+        type=int,
+        default=200,
+        help='Number of calibration images to use when --calib-dir is set (default: 200)'
+    )
+
+    parser.add_argument(
+        '--int8-method',
+        choices=['kl', 'aciq'],
+        default='kl',
+        help='INT8 calibration method (kl or aciq, default: kl)'
+    )
+
+    parser.add_argument(
+        '--calib-threads',
+        type=int,
+        default=8,
+        help='Threads for ncnn2table calibration (default: 8)'
+    )
+
+    parser.add_argument(
+        '--force',
+        action='store_true',
+        help='Allow overwriting existing INT8 outputs'
+    )
     
     parser.add_argument(
         '--for-example',
@@ -814,6 +1111,14 @@ Examples:
     )
     
     args = parser.parse_args()
+
+    if args.int8:
+        if not args.calib_dir and not args.imagelist:
+            parser.error("--int8 requires --calib-dir or --imagelist")
+        if args.calib_count <= 0:
+            parser.error("--calib-count must be > 0")
+        if args.calib_threads <= 0:
+            parser.error("--calib-threads must be > 0")
     
     example_base = args.for_example[:-4] if args.for_example and args.for_example.endswith('.cpp') else args.for_example
     mapped_model_name = None
@@ -844,7 +1149,14 @@ Examples:
         weights_path=args.weights,
         imgsz=args.imgsz,
         input_shapes_override=args.input_shapes,
-        work_dir=args.work_dir
+        work_dir=args.work_dir,
+        int8=bool(args.int8),
+        calib_dir=args.calib_dir,
+        imagelist=args.imagelist,
+        calib_count=args.calib_count,
+        int8_method=args.int8_method,
+        calib_threads=args.calib_threads,
+        force_int8=args.force
     )
     
     # Run conversion

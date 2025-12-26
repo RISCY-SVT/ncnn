@@ -610,6 +610,13 @@ int ModelWriter::fwrite_weight_tag_data(const ncnn::Mat& data, FILE* bp, float a
 {
     int p0 = ftell(bp);
 
+    if (data.elemsize == 0 || data.elempack == 0)
+    {
+        fprintf(stderr, "skip invalid weight data (elemsize=%zu elempack=%d dims=%d w=%d h=%d d=%d c=%d)\n",
+                data.elemsize, data.elempack, data.dims, data.w, data.h, data.d, data.c);
+        return -1;
+    }
+
     ncnn::Mat data_flattened = data.reshape(data.w * data.h * data.d * data.c);
     if (gen_random_weight)
         Randomize(data_flattened, a, b);
@@ -661,6 +668,13 @@ int ModelWriter::fwrite_weight_tag_data(const ncnn::Mat& data, FILE* bp, float a
 int ModelWriter::fwrite_weight_data(const ncnn::Mat& data, FILE* bp, float a, float b)
 {
     int p0 = ftell(bp);
+
+    if (data.elemsize == 0 || data.elempack == 0)
+    {
+        fprintf(stderr, "skip invalid weight data (elemsize=%zu elempack=%d dims=%d w=%d h=%d d=%d c=%d)\n",
+                data.elemsize, data.elempack, data.dims, data.w, data.h, data.d, data.c);
+        return -1;
+    }
 
     ncnn::Mat data_flattened = data.reshape(data.w * data.h * data.d * data.c);
     if (gen_random_weight)
