@@ -142,6 +142,7 @@ int Deconvolution_riscv::create_pipeline(const Option& opt)
 
 int Deconvolution_riscv::destroy_pipeline(const Option& opt)
 {
+    NCNN_UNUSED(opt);
     return 0;
 }
 

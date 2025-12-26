@@ -51,6 +51,7 @@ static void binary_op_vector_broadcast_b_fp16s(const __fp16* ptr, const __fp16* 
     const Op op;
 
     const __fp16 b = *ptr1;
+    NCNN_UNUSED(elempack);
 
 #if __riscv_zvfh
     int n = size;
@@ -81,6 +82,7 @@ static void binary_op_vector_broadcast_a_fp16s(const __fp16* ptr, const __fp16* 
     const Op op;
 
     const __fp16 a = *ptr;
+    NCNN_UNUSED(elempack);
 
 #if __riscv_zvfh
     int n = size;
@@ -109,6 +111,12 @@ template<typename Op>
 static void binary_op_vector_broadcast_pb_fp16s(const __fp16* ptr, const __fp16* ptr1, __fp16* outptr, int w, int elempack)
 {
     const Op op;
+    NCNN_UNUSED(op);
+    NCNN_UNUSED(ptr);
+    NCNN_UNUSED(ptr1);
+    NCNN_UNUSED(outptr);
+    NCNN_UNUSED(w);
+    NCNN_UNUSED(elempack);
 
 #if __riscv_zvfh
     // if (elempack == packn)
@@ -132,6 +140,12 @@ template<typename Op>
 static void binary_op_vector_broadcast_pb_b_fp16s(const __fp16* ptr, const __fp16* ptr1, __fp16* outptr, int w, int elempack)
 {
     const Op op;
+    NCNN_UNUSED(op);
+    NCNN_UNUSED(ptr);
+    NCNN_UNUSED(ptr1);
+    NCNN_UNUSED(outptr);
+    NCNN_UNUSED(w);
+    NCNN_UNUSED(elempack);
 
 #if __riscv_zvfh
     int n = w * elempack;
@@ -154,6 +168,12 @@ template<typename Op>
 static void binary_op_vector_broadcast_pb_a_fp16s(const __fp16* ptr, const __fp16* ptr1, __fp16* outptr, int w, int elempack)
 {
     const Op op;
+    NCNN_UNUSED(op);
+    NCNN_UNUSED(ptr);
+    NCNN_UNUSED(ptr1);
+    NCNN_UNUSED(outptr);
+    NCNN_UNUSED(w);
+    NCNN_UNUSED(elempack);
 
 #if __riscv_zvfh
     // if (elempack == packn)

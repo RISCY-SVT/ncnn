@@ -64,6 +64,26 @@
 
 #include "ncnn_export.h"
 
+#ifndef NCNN_MAYBE_UNUSED
+#if defined(__GNUC__) || defined(__clang__)
+#define NCNN_MAYBE_UNUSED __attribute__((unused))
+#else
+#define NCNN_MAYBE_UNUSED
+#endif
+#endif
+
+#ifndef NCNN_FALLTHROUGH
+#if defined(__GNUC__) || defined(__clang__)
+#define NCNN_FALLTHROUGH __attribute__((fallthrough))
+#else
+#define NCNN_FALLTHROUGH
+#endif
+#endif
+
+#ifndef NCNN_UNUSED
+#define NCNN_UNUSED(x) (void)(x)
+#endif
+
 #ifdef __cplusplus
 
 #if NCNN_THREADS

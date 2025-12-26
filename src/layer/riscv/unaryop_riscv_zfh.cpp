@@ -27,6 +27,7 @@ static int unary_op_inplace_fp16s(Mat& a, const Option& opt)
     int channels = a.c;
     int size = w * h * d;
     int elempack = a.elempack;
+    NCNN_UNUSED(elempack);
 
     #pragma omp parallel for num_threads(opt.num_threads)
     for (int q = 0; q < channels; q++)

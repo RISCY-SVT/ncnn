@@ -24,6 +24,7 @@ int InstanceNorm_riscv::forward_inplace_fp16s(Mat& bottom_top_blob, const Option
     int size = w * h;
 
     int dims = bottom_top_blob.dims;
+    NCNN_UNUSED(dims);
     if (elempack == 1)
     {
         #pragma omp parallel for num_threads(opt.num_threads)
@@ -194,6 +195,7 @@ int InstanceNorm_riscv::forward_inplace_fp16sa(Mat& bottom_top_blob, const Optio
     int size = w * h;
 
     int dims = bottom_top_blob.dims;
+    NCNN_UNUSED(dims);
     if (elempack == 1)
     {
         #pragma omp parallel for num_threads(opt.num_threads)
