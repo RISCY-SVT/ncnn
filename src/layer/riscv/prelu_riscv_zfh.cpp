@@ -17,6 +17,7 @@ int PReLU_riscv::forward_inplace_fp16s(Mat& bottom_top_blob, const Option& opt) 
 {
     int elempack = bottom_top_blob.elempack;
     int dims = bottom_top_blob.dims;
+    NCNN_UNUSED(elempack);
 
     if (dims == 1)
     {
@@ -215,6 +216,7 @@ int PReLU_riscv::forward_inplace_fp16sa(Mat& bottom_top_blob, const Option& opt)
 {
     int elempack = bottom_top_blob.elempack;
     int dims = bottom_top_blob.dims;
+    NCNN_UNUSED(elempack);
 
     if (dims == 1)
     {

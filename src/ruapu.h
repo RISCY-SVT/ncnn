@@ -99,7 +99,7 @@ static int ruapu_detect_isa(ruapu_some_inst some_inst)
 {
     g_ruapu_sig_caught = 0;
 
-    struct sigaction sa = { 0 };
+    struct sigaction sa = {};
     struct sigaction old_sa;
     sa.sa_flags = SA_ONSTACK | SA_RESTART | SA_SIGINFO;
     sa.sa_sigaction = ruapu_catch_sig;

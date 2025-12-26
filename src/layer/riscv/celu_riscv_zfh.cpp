@@ -32,12 +32,12 @@ int CELU_riscv::forward_inplace_fp16s(Mat& bottom_top_blob, const Option& opt) c
             size_t vl = __riscv_vsetvl_e16m8(n);
 
             vfloat16m8_t _p = __riscv_vle16_v_f16m8(ptr, vl);
-            vbool2_t _mask = __riscv_vmfgt_vf_f16m8_b2(_p, 0.f, vl);
+            vbool2_t _mask = __riscv_vmfgt_vf_f16m8_b2(_p, (__fp16)0.f, vl);
 
-            vfloat16m8_t _q = __riscv_vfdiv_vf_f16m8(_p, alpha, vl);
+            vfloat16m8_t _q = __riscv_vfdiv_vf_f16m8(_p, (__fp16)alpha, vl);
             _q = exp_ps(_q, vl);
-            _q = __riscv_vfsub_vf_f16m8(_q, 1.f, vl);
-            _q = __riscv_vfmul_vf_f16m8(_q, alpha, vl);
+            _q = __riscv_vfsub_vf_f16m8(_q, (__fp16)1.f, vl);
+            _q = __riscv_vfmul_vf_f16m8(_q, (__fp16)alpha, vl);
 
             vfloat16m8_t _res = __riscv_vmerge_vvm_f16m8(_q, _p, _mask, vl);
             __riscv_vse16_v_f16m8(ptr, _res, vl);
@@ -49,7 +49,7 @@ int CELU_riscv::forward_inplace_fp16s(Mat& bottom_top_blob, const Option& opt) c
         for (int i = 0; i < size; i++)
         {
             if (*ptr < 0)
-                *ptr = alpha * (expf((float)(*ptr / alpha)) - __fp16(1.f));
+                *ptr = (__fp16)(alpha * (expf((float)(*ptr / alpha)) - 1.f));
             ++ptr;
         }
 #endif // __riscv_vector

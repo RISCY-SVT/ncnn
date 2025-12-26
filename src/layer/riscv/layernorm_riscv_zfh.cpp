@@ -246,7 +246,7 @@ static void layernorm_fp16s(__fp16* ptr, const float* gamma_ptr, const float* be
     }
 #else  // __riscv_vector
     float sum = 0.f;
-    for (int i = 0; i < size; i++)
+    for (size_t i = 0; i < size; i++)
     {
         sum += (float)ptr[i];
     }
@@ -254,7 +254,7 @@ static void layernorm_fp16s(__fp16* ptr, const float* gamma_ptr, const float* be
     float mean = sum / size;
 
     float sqsum = 0.f;
-    for (int i = 0; i < size; i++)
+    for (size_t i = 0; i < size; i++)
     {
         float v = (float)ptr[i] - mean;
         sqsum += v * v;
@@ -267,14 +267,14 @@ static void layernorm_fp16s(__fp16* ptr, const float* gamma_ptr, const float* be
 
     if (gamma_ptr && beta_ptr)
     {
-        for (int i = 0; i < size; i++)
+        for (size_t i = 0; i < size; i++)
         {
             ptr[i] = (__fp16)(((float)ptr[i] * a + b) * gamma_ptr[i] + beta_ptr[i]);
         }
     }
     else
     {
-        for (int i = 0; i < size; i++)
+        for (size_t i = 0; i < size; i++)
         {
             ptr[i] = (__fp16)((float)ptr[i] * a + b);
         }

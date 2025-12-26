@@ -279,6 +279,7 @@ int Convolution_riscv::forward_fp16sa(const Mat& bottom_blob, Mat& top_blob, con
         return -100;
 
     const int num_input = channels * elempack;
+    NCNN_UNUSED(num_input);
 
 #if __riscv_zvfh
     if (elempack == packn && out_elempack == packn)

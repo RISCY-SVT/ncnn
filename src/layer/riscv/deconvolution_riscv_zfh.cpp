@@ -133,6 +133,7 @@ int Deconvolution_riscv::forward_fp16s(const Mat& bottom_blob, Mat& top_blob, co
     int channels = bottom_blob.c;
     size_t elemsize = bottom_blob.elemsize;
     int elempack = bottom_blob.elempack;
+    NCNN_UNUSED(channels);
 
     //     NCNN_LOGE("Deconvolution input %d x %d  pad = %d %d  ksize=%d %d  stride=%d %d", w, h, pad_w, pad_h, kernel_w, kernel_h, stride_w, stride_h);
 
@@ -214,6 +215,7 @@ int Deconvolution_riscv::forward_fp16sa(const Mat& bottom_blob, Mat& top_blob, c
     int channels = bottom_blob.c;
     size_t elemsize = bottom_blob.elemsize;
     int elempack = bottom_blob.elempack;
+    NCNN_UNUSED(channels);
 
     //     NCNN_LOGE("Deconvolution input %d x %d  pad = %d %d  ksize=%d %d  stride=%d %d", w, h, pad_w, pad_h, kernel_w, kernel_h, stride_w, stride_h);
 

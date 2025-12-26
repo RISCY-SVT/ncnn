@@ -292,6 +292,7 @@ int Crop_riscv::forward(const std::vector<Mat>& bottom_blobs, std::vector<Mat>& 
     int elempack = bottom_blob.elempack;
 
     int ref_elempack = reference_blob.elempack;
+    NCNN_UNUSED(ref_elempack);
 
     Mat& top_blob = top_blobs[0];
 

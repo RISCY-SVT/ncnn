@@ -400,9 +400,11 @@ int ShuffleChannel_riscv::forward(const Mat& bottom_blob, Mat& top_blob, const O
                 case 4:
                     ptr4 = bottom_blob.channel(q + channels_per_group * 3);
                     outptr4 = top_blob.channel(q * _group + 3);
+                    NCNN_FALLTHROUGH;
                 case 3:
                     ptr3 = bottom_blob.channel(q + channels_per_group * 2);
                     outptr3 = top_blob.channel(q * _group + 2);
+                    NCNN_FALLTHROUGH;
                 case 2:
                     ptr2 = bottom_blob.channel(q + channels_per_group);
                     outptr2 = top_blob.channel(q * _group + 1);
@@ -419,8 +421,10 @@ int ShuffleChannel_riscv::forward(const Mat& bottom_blob, Mat& top_blob, const O
                     {
                     case 4:
                         _src = __riscv_vset_v_f32m1_f32m4(_src, 3, __riscv_vle32_v_f32m1(ptr4, vl));
+                        NCNN_FALLTHROUGH;
                     case 3:
                         _src = __riscv_vset_v_f32m1_f32m4(_src, 2, __riscv_vle32_v_f32m1(ptr3, vl));
+                        NCNN_FALLTHROUGH;
                     case 2:
                         _src = __riscv_vset_v_f32m1_f32m4(_src, 1, __riscv_vle32_v_f32m1(ptr2, vl));
                         _src = __riscv_vset_v_f32m1_f32m4(_src, 0, __riscv_vle32_v_f32m1(ptr1, vl));
@@ -437,10 +441,12 @@ int ShuffleChannel_riscv::forward(const Mat& bottom_blob, Mat& top_blob, const O
                         __riscv_vse32_v_f32m1(outptr4, __riscv_vget_v_f32m4_f32m1(_dst, 3), vl);
                         outptr4 += elempack;
                         ptr4 += elempack;
+                        NCNN_FALLTHROUGH;
                     case 3:
                         __riscv_vse32_v_f32m1(outptr3, __riscv_vget_v_f32m4_f32m1(_dst, 2), vl);
                         outptr3 += elempack;
                         ptr3 += elempack;
+                        NCNN_FALLTHROUGH;
                     case 2:
                         __riscv_vse32_v_f32m1(outptr2, __riscv_vget_v_f32m4_f32m1(_dst, 1), vl);
                         outptr2 += elempack;
@@ -494,12 +500,15 @@ int ShuffleChannel_riscv::forward(const Mat& bottom_blob, Mat& top_blob, const O
                 case 8:
                     ptr8 = bottom_blob.channel(q + channels_per_group * 7);
                     outptr8 = top_blob.channel(q * _group + 7);
+                    NCNN_FALLTHROUGH;
                 case 7:
                     ptr7 = bottom_blob.channel(q + channels_per_group * 6);
                     outptr7 = top_blob.channel(q * _group + 6);
+                    NCNN_FALLTHROUGH;
                 case 6:
                     ptr6 = bottom_blob.channel(q + channels_per_group * 5);
                     outptr6 = top_blob.channel(q * _group + 5);
+                    NCNN_FALLTHROUGH;
                 case 5:
                     ptr5 = bottom_blob.channel(q + channels_per_group * 4);
                     outptr5 = top_blob.channel(q * _group + 4);
@@ -522,10 +531,13 @@ int ShuffleChannel_riscv::forward(const Mat& bottom_blob, Mat& top_blob, const O
                     {
                     case 8:
                         _src = __riscv_vset_v_f32m1_f32m8(_src, 7, __riscv_vle32_v_f32m1(ptr8, vl));
+                        NCNN_FALLTHROUGH;
                     case 7:
                         _src = __riscv_vset_v_f32m1_f32m8(_src, 6, __riscv_vle32_v_f32m1(ptr7, vl));
+                        NCNN_FALLTHROUGH;
                     case 6:
                         _src = __riscv_vset_v_f32m1_f32m8(_src, 5, __riscv_vle32_v_f32m1(ptr6, vl));
+                        NCNN_FALLTHROUGH;
                     case 5:
                         _src = __riscv_vset_v_f32m1_f32m8(_src, 4, __riscv_vle32_v_f32m1(ptr5, vl));
                         _src = __riscv_vset_v_f32m1_f32m8(_src, 3, __riscv_vle32_v_f32m1(ptr4, vl));
@@ -544,14 +556,17 @@ int ShuffleChannel_riscv::forward(const Mat& bottom_blob, Mat& top_blob, const O
                         __riscv_vse32_v_f32m1(outptr8, __riscv_vget_v_f32m8_f32m1(_dst, 7), vl);
                         outptr8 += elempack;
                         ptr8 += elempack;
+                        NCNN_FALLTHROUGH;
                     case 7:
                         __riscv_vse32_v_f32m1(outptr7, __riscv_vget_v_f32m8_f32m1(_dst, 6), vl);
                         outptr7 += elempack;
                         ptr7 += elempack;
+                        NCNN_FALLTHROUGH;
                     case 6:
                         __riscv_vse32_v_f32m1(outptr6, __riscv_vget_v_f32m8_f32m1(_dst, 5), vl);
                         outptr6 += elempack;
                         ptr6 += elempack;
+                        NCNN_FALLTHROUGH;
                     case 5:
                         __riscv_vse32_v_f32m1(outptr5, __riscv_vget_v_f32m8_f32m1(_dst, 4), vl);
                         outptr5 += elempack;
@@ -938,9 +953,11 @@ int ShuffleChannel_riscv::forward_bf16s_fp16s(const Mat& bottom_blob, Mat& top_b
                 case 4:
                     ptr4 = bottom_blob.channel(q + channels_per_group * 3);
                     outptr4 = top_blob.channel(q * _group + 3);
+                    NCNN_FALLTHROUGH;
                 case 3:
                     ptr3 = bottom_blob.channel(q + channels_per_group * 2);
                     outptr3 = top_blob.channel(q * _group + 2);
+                    NCNN_FALLTHROUGH;
                 case 2:
                     ptr2 = bottom_blob.channel(q + channels_per_group);
                     outptr2 = top_blob.channel(q * _group + 1);
@@ -957,8 +974,10 @@ int ShuffleChannel_riscv::forward_bf16s_fp16s(const Mat& bottom_blob, Mat& top_b
                     {
                     case 4:
                         _src = __riscv_vset_v_u16m1_u16m4(_src, 3, __riscv_vle16_v_u16m1(ptr4, vl));
+                        NCNN_FALLTHROUGH;
                     case 3:
                         _src = __riscv_vset_v_u16m1_u16m4(_src, 2, __riscv_vle16_v_u16m1(ptr3, vl));
+                        NCNN_FALLTHROUGH;
                     case 2:
                         _src = __riscv_vset_v_u16m1_u16m4(_src, 1, __riscv_vle16_v_u16m1(ptr2, vl));
                         _src = __riscv_vset_v_u16m1_u16m4(_src, 0, __riscv_vle16_v_u16m1(ptr1, vl));
@@ -974,10 +993,12 @@ int ShuffleChannel_riscv::forward_bf16s_fp16s(const Mat& bottom_blob, Mat& top_b
                         __riscv_vse16_v_u16m1(outptr4, __riscv_vget_v_u16m4_u16m1(_dst, 3), vl);
                         outptr4 += elempack;
                         ptr4 += elempack;
+                        NCNN_FALLTHROUGH;
                     case 3:
                         __riscv_vse16_v_u16m1(outptr3, __riscv_vget_v_u16m4_u16m1(_dst, 2), vl);
                         outptr3 += elempack;
                         ptr3 += elempack;
+                        NCNN_FALLTHROUGH;
                     case 2:
                         __riscv_vse16_v_u16m1(outptr2, __riscv_vget_v_u16m4_u16m1(_dst, 1), vl);
                         outptr2 += elempack;
@@ -1033,12 +1054,15 @@ int ShuffleChannel_riscv::forward_bf16s_fp16s(const Mat& bottom_blob, Mat& top_b
                 case 8:
                     ptr8 = bottom_blob.channel(q + channels_per_group * 7);
                     outptr8 = top_blob.channel(q * _group + 7);
+                    NCNN_FALLTHROUGH;
                 case 7:
                     ptr7 = bottom_blob.channel(q + channels_per_group * 6);
                     outptr7 = top_blob.channel(q * _group + 6);
+                    NCNN_FALLTHROUGH;
                 case 6:
                     ptr6 = bottom_blob.channel(q + channels_per_group * 5);
                     outptr6 = top_blob.channel(q * _group + 5);
+                    NCNN_FALLTHROUGH;
                 case 5:
                     ptr5 = bottom_blob.channel(q + channels_per_group * 4);
                     outptr5 = top_blob.channel(q * _group + 4);
@@ -1061,10 +1085,13 @@ int ShuffleChannel_riscv::forward_bf16s_fp16s(const Mat& bottom_blob, Mat& top_b
                     {
                     case 8:
                         _src = __riscv_vset_v_u16m1_u16m8(_src, 7, __riscv_vle16_v_u16m1(ptr8, vl));
+                        NCNN_FALLTHROUGH;
                     case 7:
                         _src = __riscv_vset_v_u16m1_u16m8(_src, 6, __riscv_vle16_v_u16m1(ptr7, vl));
+                        NCNN_FALLTHROUGH;
                     case 6:
                         _src = __riscv_vset_v_u16m1_u16m8(_src, 5, __riscv_vle16_v_u16m1(ptr6, vl));
+                        NCNN_FALLTHROUGH;
                     case 5:
                         _src = __riscv_vset_v_u16m1_u16m8(_src, 4, __riscv_vle16_v_u16m1(ptr5, vl));
                         _src = __riscv_vset_v_u16m1_u16m8(_src, 3, __riscv_vle16_v_u16m1(ptr4, vl));
@@ -1083,14 +1110,17 @@ int ShuffleChannel_riscv::forward_bf16s_fp16s(const Mat& bottom_blob, Mat& top_b
                         __riscv_vse16_v_u16m1(outptr8, __riscv_vget_v_u16m8_u16m1(_dst, 7), vl);
                         outptr8 += elempack;
                         ptr8 += elempack;
+                        NCNN_FALLTHROUGH;
                     case 7:
                         __riscv_vse16_v_u16m1(outptr7, __riscv_vget_v_u16m8_u16m1(_dst, 6), vl);
                         outptr7 += elempack;
                         ptr7 += elempack;
+                        NCNN_FALLTHROUGH;
                     case 6:
                         __riscv_vse16_v_u16m1(outptr6, __riscv_vget_v_u16m8_u16m1(_dst, 5), vl);
                         outptr6 += elempack;
                         ptr6 += elempack;
+                        NCNN_FALLTHROUGH;
                     case 5:
                         __riscv_vse16_v_u16m1(outptr5, __riscv_vget_v_u16m8_u16m1(_dst, 4), vl);
                         outptr5 += elempack;
