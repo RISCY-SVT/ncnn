@@ -80,8 +80,8 @@ static int gru_fp16s(const Mat& bottom_blob, Mat& top_blob, int reverse, const M
             {
                 float xi = x[i];
 
-                R += weight_xc_R[i] * xi;
-                U += weight_xc_U[i] * xi;
+                R = (__fp16)(R + weight_xc_R[i] * xi);
+                U = (__fp16)(U + weight_xc_U[i] * xi);
             }
 #endif // __riscv_zvfh
 
@@ -120,8 +120,8 @@ static int gru_fp16s(const Mat& bottom_blob, Mat& top_blob, int reverse, const M
             {
                 float h_cont = hidden_state[i];
 
-                R += weight_hc_R[i] * h_cont;
-                U += weight_hc_U[i] * h_cont;
+                R = (__fp16)(R + weight_hc_R[i] * h_cont);
+                U = (__fp16)(U + weight_hc_U[i] * h_cont);
             }
 #endif // __riscv_zvfh
 
@@ -447,8 +447,8 @@ static int gru_fp16sa(const Mat& bottom_blob, Mat& top_blob, int reverse, const 
             {
                 float xi = x[i];
 
-                R += weight_xc_R[i] * xi;
-                U += weight_xc_U[i] * xi;
+                R = (__fp16)(R + weight_xc_R[i] * xi);
+                U = (__fp16)(U + weight_xc_U[i] * xi);
             }
 #endif // __riscv_zvfh
 
@@ -484,15 +484,15 @@ static int gru_fp16sa(const Mat& bottom_blob, Mat& top_blob, int reverse, const 
             {
                 float h_cont = hidden_state[i];
 
-                R += weight_hc_R[i] * h_cont;
-                U += weight_hc_U[i] * h_cont;
+                R = (__fp16)(R + weight_hc_R[i] * h_cont);
+                U = (__fp16)(U + weight_hc_U[i] * h_cont);
             }
 #endif // __riscv_zvfh
 
             // sigmoid(R)
             // sigmoid(U)
-            R = 1.f / (1.f + (__fp16)expf((float)(-R)));
-            U = 1.f / (1.f + (__fp16)expf((float)(-U)));
+            R = (__fp16)(1.f / (1.f + (__fp16)expf((float)(-R))));
+            U = (__fp16)(1.f / (1.f + (__fp16)expf((float)(-U))));
 
             // gate new
             const __fp16* bias_c_WN = bias_c.row<const __fp16>(2);
@@ -528,7 +528,7 @@ static int gru_fp16sa(const Mat& bottom_blob, Mat& top_blob, int reverse, const 
             {
                 float h_cont = hidden_state[i];
 
-                N += weight_hc_N[i] * h_cont;
+                N = (__fp16)(N + weight_hc_N[i] * h_cont);
             }
 #endif // __riscv_zvfh
 
@@ -559,7 +559,7 @@ static int gru_fp16sa(const Mat& bottom_blob, Mat& top_blob, int reverse, const 
             {
                 float xi = x[i];
 
-                N += weight_xc_N[i] * xi;
+                N = (__fp16)(N + weight_xc_N[i] * xi);
             }
 #endif // __riscv_zvfh
 
@@ -583,7 +583,7 @@ static int gru_fp16sa(const Mat& bottom_blob, Mat& top_blob, int reverse, const 
             float H = (1 - U) * N + U * hidden_state[q];
 
             hidden_state[q] = H;
-            output_data[q] = H;
+            output_data[q] = (__fp16)H;
         }
     }
 
