@@ -76,12 +76,13 @@ static int gru_fp16s(const Mat& bottom_blob, Mat& top_blob, int reverse, const M
             ptr_xcr = NULL;
             ptr_xcu = NULL;
 #else  // __riscv_zvfh
+            // Non-ZVFH scalar path: keep float accumulators (R/U) to preserve original math.
             for (int i = 0; i < size; i++)
             {
                 float xi = x[i];
 
-                R = (__fp16)(R + weight_xc_R[i] * xi);
-                U = (__fp16)(U + weight_xc_U[i] * xi);
+                R += weight_xc_R[i] * xi;
+                U += weight_xc_U[i] * xi;
             }
 #endif // __riscv_zvfh
 
@@ -116,12 +117,13 @@ static int gru_fp16s(const Mat& bottom_blob, Mat& top_blob, int reverse, const M
             ptr_hcr = NULL;
             ptr_hcu = NULL;
 #else  // __riscv_zvfh
+            // Non-ZVFH scalar path: keep float accumulators (R/U) to preserve original math.
             for (int i = 0; i < num_output; i++)
             {
                 float h_cont = hidden_state[i];
 
-                R = (__fp16)(R + weight_hc_R[i] * h_cont);
-                U = (__fp16)(U + weight_hc_U[i] * h_cont);
+                R += weight_hc_R[i] * h_cont;
+                U += weight_hc_U[i] * h_cont;
             }
 #endif // __riscv_zvfh
 
