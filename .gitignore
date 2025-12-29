@@ -5,6 +5,7 @@ build*/
 models/
 models-int8/
 tmp_int8_work/
+tmp_int8_work_*/
 tmp_int8_dbg/
 ncnn-logs/
 *.log

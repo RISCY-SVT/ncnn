@@ -47,6 +47,38 @@ python3 tools/k1x/convert_yolo_to_ncnn.py \
   --force
 ```
 
+### INT8 workflow robustness
+- Table validation is fail-fast by default. Non-finite or non-positive scales abort the conversion and print the offending line.
+- Sanitization is opt-in only. Use `--allow-sanitize-nonfinite 1` to write a `*.sanitized.table` copy while preserving the original table.
+- Mixed precision is supported by commenting out table lines with `#` and the validator ignores commented and blank lines.
+
+### Reproducible INT8 conversion (KL / ACIQ)
+```
+python3 tools/k1x/convert_yolo_to_ncnn.py \
+  --for-example yolo11 \
+  --output-dir ./models-int8 \
+  --work-dir ./tmp_int8_work_kl \
+  --imgsz 640 \
+  --int8 1 \
+  --imagelist /data/datasets/coco_calib2K/imagelist.txt \
+  --calib-count 2000 \
+  --int8-method kl \
+  --calib-threads 8 \
+  --failfast-nonfinite 1
+
+python3 tools/k1x/convert_yolo_to_ncnn.py \
+  --for-example yolo11 \
+  --output-dir ./models-int8 \
+  --work-dir ./tmp_int8_work_aciq \
+  --imgsz 640 \
+  --int8 1 \
+  --imagelist /data/datasets/coco_calib2K/imagelist.txt \
+  --calib-count 2000 \
+  --int8-method aciq \
+  --calib-threads 8 \
+  --failfast-nonfinite 1
+```
+
 ### Board runs (Banana Pi BPI-F3)
 ```
 export LD_LIBRARY_PATH=/home/svt/opencv-install-k1x-gtk3/lib:${LD_LIBRARY_PATH:-}

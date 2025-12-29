@@ -1,7 +1,7 @@
 // Copyright 2025 Tencent
 // SPDX-License-Identifier: BSD-3-Clause
-// Harness-Version: 0003
-// Harness-Timestamp: 2025-12-24_08-04-14
+// Harness-Version: 0004
+// Harness-Timestamp: 2025-12-29_15-47-28
 
 // Ultralytics YOLO11 NCNN export (format=ncnn) example.
 // out0 is 2D with rows [cx, cy, w, h, class0..] over all grid cells for strides 8/16/32.
@@ -37,8 +37,8 @@
 #include <omp.h>
 #endif
 
-static const char kHarnessVersion[] = "0003";
-static const char kHarnessTimestamp[] = "2025-12-24_08-04-14";
+static const char kHarnessVersion[] = "0004";
+static const char kHarnessTimestamp[] = "2025-12-29_15-47-28";
 
 struct Object
 {
@@ -1317,6 +1317,12 @@ int main(int argc, char** argv)
                 opt.threads, pin_cpus.size());
     }
 
+    std::string param_lower = opt.param_path;
+    std::transform(param_lower.begin(), param_lower.end(), param_lower.begin(),
+                   [](unsigned char c) { return static_cast<char>(::tolower(c)); });
+    const int model_int8_hint = param_lower.find("int8") != std::string::npos ? 1 : 0;
+    ncnn::Option int8_opt;
+
     fprintf(stderr, "Effective options:\n");
     fprintf(stderr, "  harness_version: %s\n", kHarnessVersion);
     fprintf(stderr, "  harness_timestamp: %s\n", kHarnessTimestamp);
@@ -1348,6 +1354,17 @@ int main(int argc, char** argv)
     fprintf(stderr, "  fp16_packed: %d\n", opt.fp16_packed);
     fprintf(stderr, "  fp16_storage: %d\n", opt.fp16_storage);
     fprintf(stderr, "  fp16_arith: %d\n", opt.fp16_arith);
+#ifdef NCNN_INT8
+    fprintf(stderr, "  int8_build_support: %d\n", NCNN_INT8 ? 1 : 0);
+#else
+    fprintf(stderr, "  int8_build_support: unknown (no macro)\n");
+#endif
+    fprintf(stderr, "  int8_inference: %d\n", int8_opt.use_int8_inference);
+    fprintf(stderr, "  int8_packed: %d\n", int8_opt.use_int8_packed);
+    fprintf(stderr, "  int8_storage: %d\n", int8_opt.use_int8_storage);
+    fprintf(stderr, "  int8_arithmetic: %d\n", int8_opt.use_int8_arithmetic);
+    fprintf(stderr, "  int8_uniform: %d\n", int8_opt.use_int8_uniform);
+    fprintf(stderr, "  model_int8_hint: %d\n", model_int8_hint);
     fprintf(stderr, "\n");
 
     if (!opt.desired_omp_wait_policy.empty() || opt.desired_gomp_spincount >= 0)
