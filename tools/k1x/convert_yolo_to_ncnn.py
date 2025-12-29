@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
 """
+###############################################################################
+# Version: 0.1.1
+# Date:    2025-12-26
+# Author:  Sergey Tyurin
+# License: MIT
+###############################################################################
+
 YOLO to NCNN Model Converter
 
 This script automates the conversion of YOLO models to NCNN format.
@@ -28,7 +35,7 @@ import re
 import argparse
 import math
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
 
 EXAMPLE_MODEL_MAP: Dict[str, Dict[str, str]] = {
@@ -46,6 +53,147 @@ EXAMPLE_MODEL_MAP: Dict[str, Dict[str, str]] = {
     'yoloworld': {'model_name': 'yolov8s-worldv2', 'output_base': 'yolov8s_worldv2'},
     'yolov5_pnnx': {'model_name': 'yolov5s', 'output_base': 'yolov5s'},
 }
+
+
+def _validate_int8_table_file(
+    table_file: Path,
+    failfast_nonfinite: bool,
+    allow_sanitize_nonfinite: bool,
+    log_fn: Optional[Callable[[str, str], None]] = None,
+) -> Tuple[bool, Optional[Path]]:
+    def emit(message: str, level: str = 'INFO') -> None:
+        if log_fn:
+            log_fn(message, level)
+        else:
+            print(f"[{level}] {message}")
+
+    try:
+        lines = table_file.read_text().splitlines()
+    except Exception as e:
+        emit(f"Failed to read table file: {e}", 'ERROR')
+        return False, None
+
+    if not lines:
+        emit(f"Table file is empty: {table_file}", 'ERROR')
+        return False, None
+
+    # Pass 1: determine a safe fallback (smallest positive finite value)
+    min_positive = None
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith('#'):
+            continue
+        tokens = stripped.split()
+        if len(tokens) < 2:
+            continue
+        value_str = tokens[-1]
+        try:
+            value = float(value_str)
+        except ValueError:
+            continue
+        if math.isfinite(value) and value > 0:
+            min_positive = value if min_positive is None else min(min_positive, value)
+
+    if min_positive is None:
+        min_positive = 1.0
+
+    invalid_entries = []
+    sanitized_lines = []
+    replaced = 0
+
+    for lineno, line in enumerate(lines, 1):
+        stripped = line.strip()
+        if not stripped or stripped.startswith('#'):
+            sanitized_lines.append(line)
+            continue
+
+        tokens = stripped.split()
+        if len(tokens) < 2:
+            invalid_entries.append(
+                {
+                    "lineno": lineno,
+                    "raw": line,
+                    "key": "",
+                    "value": None,
+                    "reason": "missing_value",
+                }
+            )
+            sanitized_lines.append(line)
+            continue
+
+        key = tokens[0]
+        value_str = tokens[-1]
+        try:
+            value = float(value_str)
+        except ValueError:
+            value = float('nan')
+
+        is_bad = (not math.isfinite(value)) or value <= 0
+        if is_bad:
+            invalid_entries.append(
+                {
+                    "lineno": lineno,
+                    "raw": line,
+                    "key": key,
+                    "value": value,
+                    "reason": "nonfinite_or_nonpositive",
+                }
+            )
+            if allow_sanitize_nonfinite:
+                tokens[-1] = f"{min_positive:.6f}"
+                replaced += 1
+
+        if allow_sanitize_nonfinite:
+            sanitized_lines.append(" ".join(tokens))
+        else:
+            sanitized_lines.append(line)
+
+    if invalid_entries:
+        if any(entry["reason"] == "missing_value" for entry in invalid_entries):
+            entry = next(e for e in invalid_entries if e["reason"] == "missing_value")
+            emit(
+                f"Invalid table line {entry['lineno']}: missing value. Raw: {entry['raw']}",
+                'ERROR',
+            )
+            return False, None
+
+        if allow_sanitize_nonfinite:
+            sanitized_path = table_file.with_suffix(".sanitized.table")
+            sanitized_path.write_text("\n".join(sanitized_lines) + "\n")
+            emit(
+                f"Sanitized {replaced} invalid scale values using fallback {min_positive:.6f}. "
+                f"Original: {table_file} Sanitized: {sanitized_path}",
+                'WARNING',
+            )
+            for entry in invalid_entries[:5]:
+                emit(
+                    f"Sanitized line {entry['lineno']}: key={entry['key']} value={entry['value']} "
+                    f"raw={entry['raw'].rstrip()}",
+                    'WARNING',
+                )
+            return True, sanitized_path
+
+        if failfast_nonfinite:
+            for entry in invalid_entries[:5]:
+                emit(
+                    f"Invalid table line {entry['lineno']}: key={entry['key']} value={entry['value']} "
+                    f"raw={entry['raw'].rstrip()}",
+                    'ERROR',
+                )
+            emit(
+                f"Table validation failed: {len(invalid_entries)} invalid scale values found.",
+                'ERROR',
+            )
+            return False, None
+
+        emit(
+            f"Table validation warning: {len(invalid_entries)} invalid scale values found "
+            f"but fail-fast is disabled; continuing without sanitization.",
+            'WARNING',
+        )
+        return True, None
+
+    return True, None
 
 
 class YOLOConverter:
@@ -102,6 +250,8 @@ class YOLOConverter:
         int8_method: str = 'kl',
         calib_threads: int = 8,
         force_int8: bool = False,
+        failfast_nonfinite: bool = True,
+        allow_sanitize_nonfinite: bool = False,
         ncnn2table_path: Optional[str] = None,
         ncnn2int8_path: Optional[str] = None
     ):
@@ -119,6 +269,8 @@ class YOLOConverter:
         self.int8_method = int8_method.lower() if int8_method else 'kl'
         self.calib_threads = calib_threads
         self.force_int8 = force_int8
+        self.failfast_nonfinite = bool(failfast_nonfinite)
+        self.allow_sanitize_nonfinite = bool(allow_sanitize_nonfinite)
         self.ncnn2table_path = Path(ncnn2table_path).expanduser().resolve() if ncnn2table_path else None
         self.ncnn2int8_path = Path(ncnn2int8_path).expanduser().resolve() if ncnn2int8_path else None
         self.repo_root = Path(__file__).resolve().parents[2]
@@ -726,55 +878,13 @@ class YOLOConverter:
         self.log(f"Imagelist saved to: {imagelist}", 'INFO')
         return imagelist
 
-    def _sanitize_int8_table(self, table_file: Path) -> bool:
-        try:
-            lines = table_file.read_text().splitlines()
-        except Exception as e:
-            self.log(f"Failed to read table file: {e}", 'ERROR')
-            return False
-
-        changed = False
-        replaced = 0
-        sanitized_lines = []
-        for line in lines:
-            tokens = line.strip().split()
-            if len(tokens) <= 1:
-                sanitized_lines.append(line)
-                continue
-
-            max_finite = None
-            for token in tokens[1:]:
-                try:
-                    value = float(token)
-                except ValueError:
-                    continue
-                if math.isfinite(value):
-                    max_finite = value if max_finite is None else max(max_finite, abs(value))
-
-            if max_finite is None:
-                max_finite = 1.0
-
-            new_tokens = [tokens[0]]
-            for token in tokens[1:]:
-                try:
-                    value = float(token)
-                except ValueError:
-                    value = float('nan')
-
-                if math.isfinite(value):
-                    new_tokens.append(token)
-                else:
-                    new_tokens.append(f"{max_finite:.6f}")
-                    changed = True
-                    replaced += 1
-
-            sanitized_lines.append(" ".join(new_tokens))
-
-        if changed:
-            table_file.write_text("\n".join(sanitized_lines) + "\n")
-            self.log(f"Sanitized {replaced} non-finite scale values in {table_file}", 'WARNING')
-
-        return True
+    def _validate_int8_table(self, table_file: Path) -> Tuple[bool, Optional[Path]]:
+        return _validate_int8_table_file(
+            table_file,
+            self.failfast_nonfinite,
+            self.allow_sanitize_nonfinite,
+            self.log,
+        )
 
     def quantize_int8(self) -> bool:
         if not self.enable_int8:
@@ -850,8 +960,12 @@ class YOLOConverter:
         success, _ = self.run_command(cmd, "Generating calibration table (ncnn2table)")
         if not success:
             return False
-        if not self._sanitize_int8_table(table_file):
+        ok, sanitized_path = self._validate_int8_table(table_file)
+        if not ok:
             return False
+        table_to_use = sanitized_path or table_file
+        if sanitized_path:
+            self.log(f"Using sanitized table: {sanitized_path}", 'WARNING')
 
         cmd = [
             ncnn2int8,
@@ -859,7 +973,7 @@ class YOLOConverter:
             str(bin_file),
             str(out_param),
             str(out_bin),
-            str(table_file),
+            str(table_to_use),
         ]
         success, _ = self.run_command(cmd, "Quantizing model to INT8 (ncnn2int8)", check=False)
         if not success and not (out_param.exists() and out_bin.exists()):
@@ -1099,6 +1213,27 @@ Examples:
     )
 
     parser.add_argument(
+        '--failfast-nonfinite',
+        type=int,
+        choices=[0, 1],
+        default=1,
+        help='Fail fast on NaN/Inf/<=0 values in INT8 tables (default: 1)'
+    )
+
+    parser.add_argument(
+        '--allow-sanitize-nonfinite',
+        type=int,
+        choices=[0, 1],
+        default=0,
+        help='Allow sanitizing invalid INT8 table values (default: 0)'
+    )
+
+    parser.add_argument(
+        '--validate-table-only',
+        help='Validate an INT8 calibration table and exit'
+    )
+
+    parser.add_argument(
         '--force',
         action='store_true',
         help='Allow overwriting existing INT8 outputs'
@@ -1111,6 +1246,22 @@ Examples:
     )
     
     args = parser.parse_args()
+
+    if args.validate_table_only:
+        table_path = Path(args.validate_table_only).expanduser().resolve()
+        if not table_path.exists():
+            print(f"[ERROR] Table file not found: {table_path}", file=sys.stderr)
+            sys.exit(2)
+        ok, sanitized_path = _validate_int8_table_file(
+            table_path,
+            bool(args.failfast_nonfinite),
+            bool(args.allow_sanitize_nonfinite),
+        )
+        if not ok:
+            sys.exit(1)
+        if sanitized_path:
+            print(f"[INFO] Sanitized table written to: {sanitized_path}")
+        sys.exit(0)
 
     if args.int8:
         if not args.calib_dir and not args.imagelist:
@@ -1156,7 +1307,9 @@ Examples:
         calib_count=args.calib_count,
         int8_method=args.int8_method,
         calib_threads=args.calib_threads,
-        force_int8=args.force
+        force_int8=args.force,
+        failfast_nonfinite=bool(args.failfast_nonfinite),
+        allow_sanitize_nonfinite=bool(args.allow_sanitize_nonfinite),
     )
     
     # Run conversion
