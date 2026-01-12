@@ -1,121 +1,181 @@
-# NCNN on K1X (SpacemiT K1) — FP16 Compatibility Notes
+# NCNN FP16 + RVV Notes for RISC-V (SpacemiT K1X)
 
-_Last updated: 2025-12-19_
+_Last updated: 2026-01-03_
 
-This note documents a build portability issue we hit when cross-compiling **ncnn** for the Banana Pi BPI-F3 (SpacemiT K1/K1X) with RVV + FP16 enabled, and the minimal fix that made the build reliable across clean containers.
+This document records **stability and quality fixes** required to build and run ncnn on
+SpacemiT K1X (RV64GCV + RVV 1.0 + FP16 `zfh`/`zvfh`) with the SpacemiT GCC cross-toolchain.
 
----
+It is intentionally focused on:
 
-## 1. Problem: `__fp16` is used but not provided by the toolchain (RISC-V)
-
-In the ncnn codebase, `__fp16` appears in:
-
-- RISC-V RVV + FP16 (ZFH/ZVFH) code paths under `src/layer/riscv/…` (fp16 packn kernels, rvv fp16 math helpers),
-- ARM/AArch64 fp16 code paths (ASIMDHP / fp16 vector arithmetic),
-- a few shared headers.
-
-On **RISC‑V**, `_Float16` is the standard FP16 type, but `__fp16` is not standard and is not guaranteed to exist.  
-The SpacemiT GCC we use provides `_Float16` but does not define `__fp16` for RISC‑V, which causes compile failures when RVV+FP16 paths are enabled.
+- FP16 type compatibility (`__fp16` vs `_Float16`)
+- RISC-V backend warning/UB fixes we validated
+- the deterministic YOLO11 harness used for performance work
+- how this maps to our Codex skills and reproducible workflows
 
 ---
 
-## 2. Design goal
+## 1. FP16 type compatibility: `__fp16` vs `_Float16`
 
-Fix `__fp16` compilation on RISC‑V **with minimal changes**:
+### 1.1. Symptom
 
-- do not touch dozens of RVV layer source files,
-- do not affect ARM (where `__fp16` is a compiler-provided type),
-- do not require global `-D__fp16=_Float16` injection (easy to forget, can conflict).
+Some upstream ncnn code paths use `__fp16` (Arm-centric), which can be unavailable or behave
+differently on RISC-V GCC, while `_Float16` is available when FP16 extensions are enabled.
 
----
+### 1.2. Fix (canonical)
 
-## 3. Fix: a centralized RISC‑V-only typedef in `src/mat.h`
+On RISC-V builds with FP16 enabled (`__riscv_zfhmin` and/or related macros), we provide a guarded
+typedef that maps `__fp16` to `_Float16` in a way that:
 
-We introduced a small compatibility block in a central header (`src/mat.h`) that is reached by essentially all layer code (`layer.h` → `mat.h`), guarded so it only triggers on RISC‑V when FP16 is actually enabled:
+- preserves source compatibility with existing ncnn code
+- keeps compilation portable across targets
+- avoids violating ABI assumptions
 
-- only on `__riscv`
-- only if one of these macros is present:
-  - `__riscv_zfh`, `__riscv_zfhmin` (scalar FP16)
-  - `__riscv_zvfh`, `__riscv_zvfhmin` (vector FP16)
-- only if `__fp16` is not already defined
-- only if `__FP16_TYPE__` is not present (avoids collisions with toolchains that already provide a native fp16 type macro)
+**File(s):**
 
-Pseudo-logic:
-
-```c
-#if defined(__riscv)
-#  if (defined(__riscv_zfh) || defined(__riscv_zvfh) || ...) && !defined(__fp16)
-typedef _Float16 __fp16;
-#  endif
-#endif
-```
-
-This resolves the build without touching the per-layer sources.
+- `src/mat.h`
 
 ---
 
-## 4. Verification steps
+## 2. RISC-V backend: padding safety fix
 
-### 4.1. Compile-time checks (host)
+### 2.1. Symptom
 
-Ensure your `-march` defines the expected macros:
+`pad_value` in the RISC-V padding implementation could trigger warnings like:
 
-```bash
-echo | riscv64-unknown-linux-gnu-gcc ${K1_ARCH_FLAGS} -dM -E - | rg '__riscv_(vector|zvfh|zfh)'
-```
+- `-Wmaybe-uninitialized`
 
-### 4.2. Runtime checks (board)
+### 2.2. Fix
 
-- Ensure your deployed runtime library directory is visible:
+Initialize `pad_value` safely (zero-initialization) in the RISC-V padding path.
 
-```bash
-export LD_LIBRARY_PATH=/home/<user>/<runtime>/lib:$LD_LIBRARY_PATH
-```
+**File(s):**
 
-- If your sample app opens a GUI window and blocks, use `timeout` for headless smoke tests:
-
-```bash
-timeout 8s ./your_app <args...>
-```
-
-Non-zero exit codes may simply be `timeout` terminating a blocked GUI wait; verify that inference logs are printed before termination.
+- `src/layer/riscv/padding_riscv.cpp`
 
 ---
 
-## 5. Related cleanup: `pad_value` initialization warning (RISC-V padding)
+## 3. Warning/UB cleanup (quality gate)
 
-During RVV builds we also saw GCC warnings about `pad_value` potentially being used uninitialized in the RISC‑V padding layer (`src/layer/riscv/padding_riscv.cpp`) in the “packn uint16” code.
+We aim for **0 warnings** in both K1X cross-build trees:
 
-Fix strategy:
+- `build-riscv`
+- `build-riscv-bench`
 
-- initialize `vuint16m1_t pad_value` to zero at definition (safe default),
-- keep the existing branches that overwrite it for fp16/bf16 paths.
+Key changes that were validated in our K1X environment:
 
-This eliminates the warning and removes a possible UB footgun if future refactors introduce a new path.
+### 3.1. Portable unused/fallthrough helpers
+
+Introduce portable macros for:
+
+- intentionally unused variables / return values
+- intentional `switch` fallthrough
+
+**File(s):**
+
+- `src/platform.h.in` (`NCNN_UNUSED`, `NCNN_FALLTHROUGH`)
+
+### 3.2. Silence intentional fallthrough warnings (RISC-V)
+
+Annotate intentional fallthrough in RISC-V-specific layer code.
+
+**File(s):**
+
+- `src/layer/riscv/shufflechannel_riscv.cpp`
+
+### 3.3. FP16 narrowing warnings
+
+Some RVV/FP16 paths may emit narrowing warnings when converting between float and fp16 storage
+types. We silence these only with explicit casts that preserve semantics.
+
+**Representative file(s):**
+
+- `src/layer/riscv/convolution_winograd_transform_packn_fp16s.h`
+- `src/layer/riscv/interp_riscv_zfh.cpp`
+
+### 3.4. RUAPU portable `sigaction` initialization
+
+Avoid partial/uninitialized `sigaction` structs by using:
+
+- `memset(&sa, 0, sizeof(sa))`
+- `sigemptyset(&sa.sa_mask)`
+
+**File(s):**
+
+- `src/ruapu.h`
+
+### 3.5. GRU accumulation correctness (non-ZVFH path)
+
+Preserve float accumulators in scalar (non-ZVFH) accumulation paths to avoid precision regressions.
+
+**File(s):**
+
+- `src/layer/riscv/gru_riscv_zfh.cpp`
 
 ---
 
-## 6. Benchmarking note (why timings vary)
+## 4. Deterministic YOLO11 harness (canonical baseline)
 
-One-off GUI runs are noisy because they include:
+The canonical reproducible benchmark harness lives at:
 
-- image I/O, preprocessing and postprocessing,
-- window creation / display sync,
-- DVFS and cache state.
+- `examples/yolo11.cpp`
 
-Preferred method:
+Key features:
 
-- prepare input once,
-- run 10 warmups,
-- time 100 “forward-only” iterations,
-- report mean and variance.
+- in-program CPU pinning:
+  - `--pin cluster0|none|list:<cpu_list>`
+- strict environment mode:
+  - `--strict-omp-env 1` fails fast if `OMP_*` / `GOMP_*` env vars are set
+  - strict mode also forbids `--desired-*` overrides
+- deterministic benchmarking:
+  - `--warmup <N> --runs <N> --repeats <N>`
+  - prints mean + stddev across repeats
+- quiet mode for performance runs:
+  - `--quiet` reduces log noise
+- explicit model paths:
+  - `--model-dir`, `--model-name`, `--param`, `--bin`
+- prints build/runtime INT8 flags for diagnostics
 
-(Our YOLO11 example was refactored accordingly; see `examples/yolo11.cpp` in our working tree.)
+Canonical baseline settings on the board:
+
+- `--pin cluster0 --threads 4`
+- `--warmup 10 --runs 100 --repeats 5`
+- `--strict-omp-env 1 --quiet`
 
 ---
 
-## 7. Key takeaways
+## 5. Build knobs (K1X cross-build)
 
-- On RISC‑V, prefer `_Float16` in new code.  
-- For existing codebases that use `__fp16`, a **central guarded typedef** is often the least invasive solution.
-- Always confirm RVV flags are applied globally and benchmark forward-only loops for meaningful performance comparisons.
+We build ncnn with:
+
+- `-DNCNN_RVV=ON`
+- `-DNCNN_OPENMP=ON`
+- `-DNCNN_XTHEADVECTOR=OFF`
+- `-DCMAKE_BUILD_TYPE=Release`
+
+Benchmark build adds:
+
+- `-DNCNN_BENCHMARK=ON`
+
+INT8 coverage build adds:
+
+- `-DNCNN_INT8=ON`
+
+Build orchestration is typically done via `/data/build_scripts/05-build-opencv-ncnn.sh`, or via
+Codex skills (see next section).
+
+---
+
+## 6. Codex skills mapping (recommended operator path)
+
+This project maintains custom Codex skills (installed to `/data/.codex/skills` and `/etc/codex/skills`)
+to keep builds and runs reproducible:
+
+- `$k1x_env_sanity` – toolchain/sysroot/board readiness
+- `$k1x_cross_build_ncnn` – cross-build + warning scan
+- `$k1x_deploy_and_run_yolo11` – deterministic FP16 benchmark on the board
+- `$k1x_layer_hotspots_report` – per-layer benchmark + Top-N extraction
+- `$k1x_int8_quantize_yolo11` – INT8 table + int8 conversion with fail-fast validation
+- `$k1x_git_hygiene` – repo hygiene / `.gitignore` / secret-like scan
+
+See `k1x-env-overview.md` for acceptance-test references.
+
