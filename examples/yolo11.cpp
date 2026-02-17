@@ -22,6 +22,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <float.h>
+#include <stdint.h>
 #include <math.h>
 #include <pthread.h>
 #include <sched.h>
@@ -92,6 +93,10 @@ struct Yolo11Options
     int print_affinity = 1;
     bool print_affinity_set = false;
     bool quiet = false;
+    int dump_hash = 0;
+    std::string dump_out_path;
+    std::string dump_blob_name;
+    std::string dump_blob_path;
     std::string desired_omp_wait_policy;
     int desired_gomp_spincount = -1;
 };
@@ -117,6 +122,10 @@ static void print_usage(const char* prog)
     fprintf(stderr, "  --strict-omp-env 0/1\n");
     fprintf(stderr, "  --print-affinity 0/1\n");
     fprintf(stderr, "  --quiet\n");
+    fprintf(stderr, "  --dump-hash [0/1]\n");
+    fprintf(stderr, "  --dump-out <path>\n");
+    fprintf(stderr, "  --dump-blob <name>\n");
+    fprintf(stderr, "  --dump-blob-out <path>\n");
     fprintf(stderr, "  --desired-omp-wait-policy <PASSIVE|ACTIVE> (requires --strict-omp-env 0)\n");
     fprintf(stderr, "  --desired-gomp-spincount N (requires --strict-omp-env 0)\n");
     fprintf(stderr, "  --lightmode 0/1\n");
@@ -148,6 +157,89 @@ static int parse_bool_arg(const char* s, int& out)
     if (v != 0 && v != 1)
         return -1;
     out = v;
+    return 0;
+}
+
+static uint64_t fnv1a_64(const unsigned char* data, size_t len)
+{
+    uint64_t hash = 14695981039346656037ull;
+    for (size_t i = 0; i < len; i++)
+    {
+        hash ^= (uint64_t)data[i];
+        hash *= 1099511628211ull;
+    }
+    return hash;
+}
+
+static void dump_mat_hash(const char* name, const ncnn::Mat& m)
+{
+    const size_t bytes = m.total() * m.elemsize;
+    const unsigned char* data = (const unsigned char*)m.data;
+    uint64_t hash = 0;
+    if (data && bytes > 0)
+        hash = fnv1a_64(data, bytes);
+    fprintf(stderr, "HASH %s 0x%016llx w=%d h=%d c=%d elemsize=%zu elempack=%d\n",
+            name, (unsigned long long)hash, m.w, m.h, m.c, m.elemsize, m.elempack);
+}
+
+static int dump_mat_raw_fp32(const char* name, const ncnn::Mat& m, const std::string& path)
+{
+    if (path.empty())
+        return 0;
+
+    ncnn::Option opt;
+    opt.num_threads = 1;
+
+    ncnn::Mat pack1 = m;
+    ncnn::Mat pack1_tmp;
+    if (m.elempack != 1)
+    {
+        ncnn::convert_packing(m, pack1_tmp, 1, opt);
+        pack1 = pack1_tmp;
+    }
+
+    ncnn::Mat fp32;
+    if (pack1.elemsize == 4u)
+    {
+        fp32 = pack1;
+    }
+    else if (pack1.elemsize == 2u)
+    {
+        ncnn::cast_float16_to_float32(pack1, fp32, opt);
+    }
+    else
+    {
+        fprintf(stderr, "dump-out %s: unsupported elemsize=%zu\n", name, pack1.elemsize);
+        return -1;
+    }
+
+    const size_t bytes = fp32.total() * fp32.elemsize;
+    FILE* f = fopen(path.c_str(), "wb");
+    if (!f)
+    {
+        fprintf(stderr, "dump-out %s: open %s failed: %s\n", name, path.c_str(), strerror(errno));
+        return -1;
+    }
+    size_t wrote = fwrite(fp32.data, 1, bytes, f);
+    fclose(f);
+    if (wrote != bytes)
+    {
+        fprintf(stderr, "dump-out %s: short write %zu/%zu\n", name, wrote, bytes);
+        return -1;
+    }
+
+    std::string meta_path = path + ".meta";
+    FILE* fm = fopen(meta_path.c_str(), "w");
+    if (!fm)
+    {
+        fprintf(stderr, "dump-out %s: open %s failed: %s\n", name, meta_path.c_str(), strerror(errno));
+        return -1;
+    }
+    fprintf(fm, "name=%s\nw=%d\nh=%d\nc=%d\nelemsize=%zu\nelempack=%d\n",
+            name, fp32.w, fp32.h, fp32.c, fp32.elemsize, fp32.elempack);
+    fclose(fm);
+
+    fprintf(stderr, "DUMP_OUT %s %s bytes=%zu\n", name, path.c_str(), bytes);
     return 0;
 }
 
@@ -492,6 +584,33 @@ static void extractor_set_num_threads(T&, int, ...)
 {
 }
 
+static int extract_blob(const Yolo11Context& ctx, const ncnn::Mat& in_pad, const char* name, ncnn::Mat& out, int num_threads, int lightmode)
+{
+    if (!name || name[0] == '\0')
+        return 0;
+
+    ncnn::Extractor ex = ctx.net.create_extractor();
+    extractor_set_num_threads(ex, num_threads, 0);
+    if (lightmode)
+        ex.set_light_mode(true);
+
+    int ret_in = ex.input("in0", in_pad);
+    if (ret_in != 0)
+    {
+        fprintf(stderr, "input in0 failed, code=%d\n", ret_in);
+        return ret_in;
+    }
+
+    int ret = ex.extract(name, out);
+    if (ret != 0)
+    {
+        fprintf(stderr, "extract %s failed, code=%d\n", name, ret);
+        return ret;
+    }
+
+    return 0;
+}
+
 static inline float intersection_area(const Object& a, const Object& b)
 {
     cv::Rect_<float> inter = a.rect & b.rect;
@@ -796,7 +915,8 @@ static void decode_yolo11(const ncnn::Mat& out, const Yolo11Preproc& prep, const
 static int benchmark_yolo11_forward_only(const Yolo11Context& ctx, const ncnn::Mat& in_pad,
                                          int num_threads, int lightmode,
                                          int warmup_runs, int bench_runs, int repeats,
-                                         bool print_out_shape, bool quiet)
+                                         bool print_out_shape, bool quiet, bool dump_hash,
+                                         const std::string& dump_out_path)
 {
     // Quiet mode suppresses per-iteration markers and shape prints while keeping summaries.
     if (bench_runs < 1 || repeats < 1)
@@ -836,6 +956,16 @@ static int benchmark_yolo11_forward_only(const Yolo11Context& ctx, const ncnn::M
             {
                 fprintf(stderr, "out0 shape: w=%d h=%d c=%d\n", out.w, out.h, out.c);
             }
+        }
+
+        if (dump_hash && r == repeats - 1)
+        {
+            dump_mat_hash("out0", out);
+        }
+        if (!dump_out_path.empty() && r == repeats - 1)
+        {
+            if (dump_mat_raw_fp32("out0", out, dump_out_path) != 0)
+                return -1;
         }
 
         double avg_us = sum_us / bench_runs;
@@ -1094,6 +1224,43 @@ int main(int argc, char** argv)
             opt.quiet = true;
             continue;
         }
+        if (strcmp(arg, "--dump-hash") == 0)
+        {
+            opt.dump_hash = 1;
+            if (i + 1 < argc && parse_bool_arg(argv[i + 1], opt.dump_hash) == 0)
+                i++;
+            continue;
+        }
+        if (strcmp(arg, "--dump-out") == 0)
+        {
+            if (i + 1 >= argc)
+            {
+                print_usage(argv[0]);
+                return -1;
+            }
+            opt.dump_out_path = argv[++i];
+            continue;
+        }
+        if (strcmp(arg, "--dump-blob") == 0)
+        {
+            if (i + 1 >= argc)
+            {
+                print_usage(argv[0]);
+                return -1;
+            }
+            opt.dump_blob_name = argv[++i];
+            continue;
+        }
+        if (strcmp(arg, "--dump-blob-out") == 0)
+        {
+            if (i + 1 >= argc)
+            {
+                print_usage(argv[0]);
+                return -1;
+            }
+            opt.dump_blob_path = argv[++i];
+            continue;
+        }
         if (strcmp(arg, "--desired-omp-wait-policy") == 0)
         {
             if (i + 1 >= argc)
@@ -1344,6 +1511,13 @@ int main(int argc, char** argv)
     fprintf(stderr, "  strict_omp_env: %d\n", opt.strict_omp_env);
     fprintf(stderr, "  print_affinity: %d\n", opt.print_affinity);
     fprintf(stderr, "  quiet: %d\n", opt.quiet ? 1 : 0);
+    fprintf(stderr, "  dump_hash: %d\n", opt.dump_hash ? 1 : 0);
+    if (!opt.dump_out_path.empty())
+        fprintf(stderr, "  dump_out: %s\n", opt.dump_out_path.c_str());
+    if (!opt.dump_blob_name.empty())
+        fprintf(stderr, "  dump_blob: %s\n", opt.dump_blob_name.c_str());
+    if (!opt.dump_blob_path.empty())
+        fprintf(stderr, "  dump_blob_out: %s\n", opt.dump_blob_path.c_str());
     fprintf(stderr, "  desired_omp_wait_policy: %s\n",
             opt.desired_omp_wait_policy.empty() ? "(unspecified)" : opt.desired_omp_wait_policy.c_str());
     fprintf(stderr, "  desired_gomp_spincount: %d\n", opt.desired_gomp_spincount);
@@ -1421,10 +1595,23 @@ int main(int argc, char** argv)
     {
         // Bench-only: only warmup + timed forward passes (no decode/draw).
         if (benchmark_yolo11_forward_only(ctx, prep.in_pad, opt.threads, opt.lightmode,
-                                          opt.warmup, opt.runs, opt.repeats, true, opt.quiet) != 0)
+                                          opt.warmup, opt.runs, opt.repeats, true, opt.quiet, opt.dump_hash != 0,
+                                          opt.dump_out_path) != 0)
         {
             fprintf(stderr, "benchmark_yolo11_forward_only failed\n");
             return -1;
+        }
+        if (!opt.dump_blob_name.empty())
+        {
+            ncnn::Mat blob;
+            if (extract_blob(ctx, prep.in_pad, opt.dump_blob_name.c_str(), blob, opt.threads, opt.lightmode) != 0)
+                return -1;
+            dump_mat_hash(opt.dump_blob_name.c_str(), blob);
+            if (!opt.dump_blob_path.empty())
+            {
+                if (dump_mat_raw_fp32(opt.dump_blob_name.c_str(), blob, opt.dump_blob_path) != 0)
+                    return -1;
+            }
         }
         return 0;
     }
@@ -1442,6 +1629,25 @@ int main(int argc, char** argv)
     }
     if (!opt.quiet)
         fprintf(stderr, "out0 shape: w=%d h=%d c=%d\n", out.w, out.h, out.c);
+    if (opt.dump_hash)
+        dump_mat_hash("out0", out);
+    if (!opt.dump_out_path.empty())
+    {
+        if (dump_mat_raw_fp32("out0", out, opt.dump_out_path) != 0)
+            return -1;
+    }
+    if (!opt.dump_blob_name.empty())
+    {
+        ncnn::Mat blob;
+        if (extract_blob(ctx, prep.in_pad, opt.dump_blob_name.c_str(), blob, opt.threads, opt.lightmode) != 0)
+            return -1;
+        dump_mat_hash(opt.dump_blob_name.c_str(), blob);
+        if (!opt.dump_blob_path.empty())
+        {
+            if (dump_mat_raw_fp32(opt.dump_blob_name.c_str(), blob, opt.dump_blob_path) != 0)
+                return -1;
+        }
+    }
     auto t_fwd1 = std::chrono::high_resolution_clock::now();
 
     auto t_total1 = t_fwd1;
@@ -1463,7 +1669,8 @@ int main(int argc, char** argv)
     }
 
     if (opt.runs > 0 && benchmark_yolo11_forward_only(ctx, prep.in_pad, opt.threads, opt.lightmode,
-                                                      opt.warmup, opt.runs, opt.repeats, false, opt.quiet) != 0)
+                                                      opt.warmup, opt.runs, opt.repeats, false, opt.quiet, false,
+                                                      std::string()) != 0)
     {
         fprintf(stderr, "benchmark_yolo11_forward_only failed\n");
     }

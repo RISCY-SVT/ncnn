@@ -3,6 +3,14 @@
 
 #include "convolution_riscv.h"
 
+#include <algorithm>
+#include <atomic>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <mutex>
+#include <vector>
+
 #include "benchmark.h"
 #include "cpu.h"
 #include "layer_type.h"
@@ -13,9 +21,238 @@
 #include "riscv_activation.h"
 #include "riscv_usability.h"
 
-#include "cpu.h"
-
 namespace ncnn {
+
+#if NCNN_INT8
+struct riscv_int8_coverage_counters_t
+{
+    std::atomic<unsigned long long> conv_int8_pack1_1x1_fast_count{0};
+    std::atomic<unsigned long long> conv_int8_pack1_3x3s1_fast_count{0};
+    std::atomic<unsigned long long> conv_int8_pack1_3x3s2_fast_count{0};
+    std::atomic<unsigned long long> conv_int8_fallback_count{0};
+
+    std::atomic<unsigned long long> fallback_reason_dims_ne3{0};
+    std::atomic<unsigned long long> fallback_reason_dilation_ne1{0};
+    std::atomic<unsigned long long> fallback_reason_stride_not_1_or_2{0};
+    std::atomic<unsigned long long> fallback_reason_kernel_not_1_or_3{0};
+    std::atomic<unsigned long long> fallback_reason_group_or_channel_mismatch{0};
+    std::atomic<unsigned long long> fallback_reason_int8_scale_term_0{0};
+    std::atomic<unsigned long long> fallback_reason_int8_uniform_false{0};
+    std::atomic<unsigned long long> fallback_reason_bottom_elempack_ne1{0};
+    std::atomic<unsigned long long> fallback_reason_disable_global{0};
+    std::atomic<unsigned long long> fallback_reason_disable_prep{0};
+    std::atomic<unsigned long long> fallback_reason_disable_1x1{0};
+    std::atomic<unsigned long long> fallback_reason_disable_3x3s1{0};
+    std::atomic<unsigned long long> fallback_reason_disable_3x3s2{0};
+};
+
+static riscv_int8_coverage_counters_t g_riscv_int8_coverage_counters;
+
+static inline int riscv_int8_coverage_enabled()
+{
+    static const int g_enabled = []() -> int
+    {
+        const char* env = getenv("NCNN_RISCV_INT8_COVERAGE");
+        return (env && env[0] != '\0' && env[0] != '0') ? 1 : 0;
+    }();
+    return g_enabled;
+}
+
+static void riscv_int8_coverage_dump()
+{
+    if (!riscv_int8_coverage_enabled())
+        return;
+
+    const auto load = [](const std::atomic<unsigned long long>& v) -> unsigned long long
+    {
+        return v.load(std::memory_order_relaxed);
+    };
+
+    NCNN_LOGE("riscv_int8_coverage conv_int8_pack1_1x1_fast_count=%llu conv_int8_pack1_3x3s1_fast_count=%llu conv_int8_pack1_3x3s2_fast_count=%llu conv_int8_fallback_count=%llu "
+              "fallback_reason_dims_ne3=%llu fallback_reason_dilation_ne1=%llu fallback_reason_stride_not_1_or_2=%llu fallback_reason_kernel_not_1_or_3=%llu "
+              "fallback_reason_group_or_channel_mismatch=%llu fallback_reason_int8_scale_term_0=%llu fallback_reason_int8_uniform_false=%llu fallback_reason_bottom_elempack_ne1=%llu "
+              "fallback_reason_disable_global=%llu fallback_reason_disable_prep=%llu fallback_reason_disable_1x1=%llu fallback_reason_disable_3x3s1=%llu fallback_reason_disable_3x3s2=%llu",
+              load(g_riscv_int8_coverage_counters.conv_int8_pack1_1x1_fast_count),
+              load(g_riscv_int8_coverage_counters.conv_int8_pack1_3x3s1_fast_count),
+              load(g_riscv_int8_coverage_counters.conv_int8_pack1_3x3s2_fast_count),
+              load(g_riscv_int8_coverage_counters.conv_int8_fallback_count),
+              load(g_riscv_int8_coverage_counters.fallback_reason_dims_ne3),
+              load(g_riscv_int8_coverage_counters.fallback_reason_dilation_ne1),
+              load(g_riscv_int8_coverage_counters.fallback_reason_stride_not_1_or_2),
+              load(g_riscv_int8_coverage_counters.fallback_reason_kernel_not_1_or_3),
+              load(g_riscv_int8_coverage_counters.fallback_reason_group_or_channel_mismatch),
+              load(g_riscv_int8_coverage_counters.fallback_reason_int8_scale_term_0),
+              load(g_riscv_int8_coverage_counters.fallback_reason_int8_uniform_false),
+              load(g_riscv_int8_coverage_counters.fallback_reason_bottom_elempack_ne1),
+              load(g_riscv_int8_coverage_counters.fallback_reason_disable_global),
+              load(g_riscv_int8_coverage_counters.fallback_reason_disable_prep),
+              load(g_riscv_int8_coverage_counters.fallback_reason_disable_1x1),
+              load(g_riscv_int8_coverage_counters.fallback_reason_disable_3x3s1),
+              load(g_riscv_int8_coverage_counters.fallback_reason_disable_3x3s2));
+}
+
+static inline void riscv_int8_coverage_register_atexit_once()
+{
+    static std::once_flag g_coverage_once;
+    std::call_once(g_coverage_once, []() { atexit(riscv_int8_coverage_dump); });
+}
+
+static inline signed char float2int8_rvv(float v)
+{
+    int int32 = (int)(v >= 0.f ? v + 0.5f : v - 0.5f);
+    if (int32 > 127) return 127;
+    if (int32 < -127) return -127;
+    return (signed char)int32;
+}
+
+static inline int riscv_int8_conv_disabled()
+{
+    static const int g_disable = []() -> int
+    {
+        const char* env = getenv("NCNN_RISCV_INT8_CONV_DISABLE");
+        return (env && env[0] != '\0' && env[0] != '0') ? 1 : 0;
+    }();
+    return g_disable;
+}
+
+static inline int riscv_int8_conv1x1_disabled()
+{
+    static const int g_disable = []() -> int
+    {
+        const char* env = getenv("NCNN_RISCV_INT8_CONV_DISABLE_1X1");
+        return (env && env[0] != '\0' && env[0] != '0') ? 1 : 0;
+    }();
+    return g_disable;
+}
+
+static inline int riscv_int8_conv3x3_disabled()
+{
+    static const int g_disable = []() -> int
+    {
+        const char* env = getenv("NCNN_RISCV_INT8_CONV_DISABLE_3X3");
+        return (env && env[0] != '\0' && env[0] != '0') ? 1 : 0;
+    }();
+    return g_disable;
+}
+
+static inline int riscv_int8_conv3x3s1_disabled()
+{
+    static const int g_disable = []() -> int
+    {
+        const char* env = getenv("NCNN_RISCV_INT8_CONV_DISABLE_3X3S1");
+        return (env && env[0] != '\0' && env[0] != '0') ? 1 : 0;
+    }();
+    return g_disable;
+}
+
+static inline int riscv_int8_conv3x3s2_disabled()
+{
+    static const int g_disable = []() -> int
+    {
+        const char* env = getenv("NCNN_RISCV_INT8_CONV_DISABLE_3X3S2");
+        return (env && env[0] != '\0' && env[0] != '0') ? 1 : 0;
+    }();
+    return g_disable;
+}
+
+static inline int riscv_int8_conv_prep_disabled()
+{
+    static const int g_disable = []() -> int
+    {
+        const char* env = getenv("NCNN_RISCV_INT8_CONV_DISABLE_PREP");
+        return (env && env[0] != '\0' && env[0] != '0') ? 1 : 0;
+    }();
+    return g_disable;
+}
+
+static inline int riscv_int8_conv_force_fma()
+{
+    static const int g_force = []() -> int
+    {
+        const char* env = getenv("NCNN_RISCV_INT8_CONV_FORCE_FMA");
+        return (env && env[0] != '\0' && env[0] != '0') ? 1 : 0;
+    }();
+    return g_force;
+}
+
+static inline int riscv_int8_conv_no_fma()
+{
+    static const int g_no = []() -> int
+    {
+        const char* env = getenv("NCNN_RISCV_INT8_CONV_NO_FMA");
+        return (env && env[0] != '\0' && env[0] != '0') ? 1 : 0;
+    }();
+    return g_no;
+}
+
+static inline float riscv_int8_conv_accum_fp32(int sum, float scale_in, float bias, int bias_term, int force_fma, int no_fma)
+{
+    if (force_fma)
+        return std::fmaf((float)sum, scale_in, bias_term ? bias : 0.f);
+
+    float sumfp32;
+    if (no_fma)
+    {
+        volatile float prod = (float)sum * scale_in;
+        sumfp32 = prod;
+    }
+    else
+    {
+        sumfp32 = (float)sum * scale_in;
+    }
+
+    if (bias_term)
+        sumfp32 += bias;
+
+    return sumfp32;
+}
+
+static inline int* riscv_get_sums_buffer(size_t n)
+{
+    thread_local std::vector<int> buf;
+    if (buf.size() < n)
+        buf.resize(n);
+    return buf.data();
+}
+
+static int quantize_to_int8_pack1(const Mat& src, Mat& dst, float scale, const Option& opt)
+{
+    const int w = src.w;
+    const int h = src.h;
+    const int channels = src.c;
+    const int elempack = src.elempack;
+    const int outc = channels * elempack;
+
+    dst.create(w, h, outc, (size_t)1u, opt.blob_allocator);
+    if (dst.empty())
+        return -100;
+
+    #pragma omp parallel for num_threads(opt.num_threads)
+    for (int q = 0; q < channels; q++)
+    {
+        const float* ptr = src.channel(q);
+        std::vector<signed char*> outptrs(elempack);
+        for (int k = 0; k < elempack; k++)
+            outptrs[k] = dst.channel(q * elempack + k);
+
+        for (int i = 0; i < w * h; i++)
+        {
+            const float* v = ptr + i * elempack;
+            for (int k = 0; k < elempack; k++)
+                outptrs[k][i] = float2int8_rvv(v[k] * scale);
+        }
+    }
+
+    return 0;
+}
+
+#if NCNN_RISCV_INT8_CONV_STATS
+static std::atomic<int> g_riscv_int8_elemsize_1(0);
+static std::atomic<int> g_riscv_int8_elemsize_2(0);
+static std::atomic<int> g_riscv_int8_elemsize_4(0);
+static std::atomic<int> g_riscv_int8_elempack_ne1(0);
+#endif
+#endif // NCNN_INT8
 
 #include "convolution_sgemm.h"
 #include "convolution_winograd_transform.h"
@@ -228,28 +465,1148 @@ int Convolution_riscv::destroy_pipeline(const Option& opt)
 int Convolution_riscv::forward(const Mat& bottom_blob, Mat& top_blob, const Option& opt) const
 {
 #if NCNN_INT8
+    const bool coverage_enabled = riscv_int8_coverage_enabled() != 0;
+    if (coverage_enabled)
+        riscv_int8_coverage_register_atexit_once();
+
+    if (coverage_enabled && opt.use_int8_inference && !int8_scale_term)
+    {
+        g_riscv_int8_coverage_counters.conv_int8_fallback_count.fetch_add(1, std::memory_order_relaxed);
+        g_riscv_int8_coverage_counters.fallback_reason_int8_scale_term_0.fetch_add(1, std::memory_order_relaxed);
+    }
+
     if (opt.use_int8_inference && int8_scale_term)
     {
-        Mat bottom_blob_unpacked = bottom_blob;
-        if (bottom_blob.elempack != 1)
+#if NCNN_RISCV_INT8_CONV_STATS
+        const size_t stats_elemsize = bottom_blob.elemsize;
+        const int stats_elempack = bottom_blob.elempack;
+        if (stats_elemsize == 1u)
+            g_riscv_int8_elemsize_1.fetch_add(1, std::memory_order_relaxed);
+        else if (stats_elemsize == 2u)
+            g_riscv_int8_elemsize_2.fetch_add(1, std::memory_order_relaxed);
+        else if (stats_elemsize == 4u)
+            g_riscv_int8_elemsize_4.fetch_add(1, std::memory_order_relaxed);
+        if (stats_elempack != 1)
+            g_riscv_int8_elempack_ne1.fetch_add(1, std::memory_order_relaxed);
+
+        double stats_cast_ms = 0.0;
+        double stats_pack_ms = 0.0;
+        double stats_quant_ms = 0.0;
+        int stats_cast_calls = 0;
+        int stats_pack_calls = 0;
+        int stats_quant_calls = 0;
+        auto stats_dump = [&](const char* tag)
+        {
+            NCNN_LOGE("int8 stats [%s]: elemsize=%zu elempack=%d totals: e1=%d e2=%d e4=%d packne1=%d cast_ms=%.3f pack_ms=%.3f quant_ms=%.3f cast_calls=%d pack_calls=%d quant_calls=%d",
+                      tag, stats_elemsize, stats_elempack,
+                      g_riscv_int8_elemsize_1.load(std::memory_order_relaxed),
+                      g_riscv_int8_elemsize_2.load(std::memory_order_relaxed),
+                      g_riscv_int8_elemsize_4.load(std::memory_order_relaxed),
+                      g_riscv_int8_elempack_ne1.load(std::memory_order_relaxed),
+                      stats_cast_ms, stats_pack_ms, stats_quant_ms,
+                      stats_cast_calls, stats_pack_calls, stats_quant_calls);
+        };
+#endif
+
+        Mat bottom_blob_fp32 = bottom_blob;
+        if (bottom_blob_fp32.elembits() == 16)
         {
             Option opt_pack1 = opt;
             opt_pack1.blob_allocator = opt.workspace_allocator;
 
-            convert_packing(bottom_blob, bottom_blob_unpacked, 1, opt_pack1);
+#if NCNN_RISCV_INT8_CONV_STATS
+            double t0 = get_current_time();
+#endif
+            cast_float16_to_float32(bottom_blob, bottom_blob_fp32, opt_pack1);
+#if NCNN_RISCV_INT8_CONV_STATS
+            stats_cast_ms += get_current_time() - t0;
+            stats_cast_calls += 1;
+#endif
         }
 
-        Mat bottom_blob_unpacked_fp32 = bottom_blob_unpacked;
-        if (bottom_blob_unpacked.elembits() == 16)
+        const bool int8_uniform = bottom_blob_int8_scales.w == 1;
+
+#if __riscv_vector
+        auto prepare_int8_pack1 = [&](Mat& bottom_blob_int8_pack1) -> int
+        {
+            if (riscv_int8_conv_prep_disabled())
+                return -100;
+
+            auto ensure_pack1 = [&](Mat& m) -> int
+            {
+                if (m.empty())
+                    return -100;
+                if (m.elempack == 1)
+                    return 0;
+
+                #if NCNN_RISCV_INT8_CONV_DEBUG
+                const int inpack = m.elempack;
+                #endif
+                Option opt_pack1 = opt;
+                opt_pack1.blob_allocator = opt.workspace_allocator;
+                Mat tmp;
+                convert_packing(m, tmp, 1, opt_pack1);
+                if (tmp.empty())
+                    return -100;
+                m = tmp;
+#if NCNN_RISCV_INT8_CONV_DEBUG
+                static int g_rvv_int8_force_pack1 = 0;
+                if (g_rvv_int8_force_pack1 < 8)
+                {
+                    NCNN_LOGE("rvv int8 prep: force pack1 (input pack=%d)", inpack);
+                    g_rvv_int8_force_pack1++;
+                }
+#endif
+                return 0;
+            };
+
+            if (bottom_blob_fp32.elembits() == 8)
+            {
+                if (bottom_blob_fp32.elempack == 1)
+                {
+                    bottom_blob_int8_pack1 = bottom_blob_fp32;
+                    return ensure_pack1(bottom_blob_int8_pack1);
+                }
+
+                Option opt_pack1 = opt;
+                opt_pack1.blob_allocator = opt.workspace_allocator;
+
+#if NCNN_RISCV_INT8_CONV_STATS
+                double t0 = get_current_time();
+#endif
+                convert_packing(bottom_blob_fp32, bottom_blob_int8_pack1, 1, opt_pack1);
+#if NCNN_RISCV_INT8_CONV_STATS
+                stats_pack_ms += get_current_time() - t0;
+                stats_pack_calls += 1;
+#endif
+                if (bottom_blob_int8_pack1.empty())
+                    return -100;
+#if NCNN_RISCV_INT8_CONV_DEBUG
+                static int g_rvv_int8_prep_warn = 0;
+                if (bottom_blob_int8_pack1.elempack != 1 && g_rvv_int8_prep_warn < 8)
+                {
+                    NCNN_LOGE("rvv int8 prep warn: int8 input elempack=%d -> out elempack=%d",
+                              bottom_blob_fp32.elempack, bottom_blob_int8_pack1.elempack);
+                    g_rvv_int8_prep_warn++;
+                }
+#endif
+                return ensure_pack1(bottom_blob_int8_pack1);
+            }
+
+            Option opt_g = opt;
+            opt_g.blob_allocator = opt.workspace_allocator;
+            // Force pack1 output from Quantize for int8 fast paths.
+            opt_g.use_packing_layout = false;
+
+            if (bottom_blob_fp32.elempack != 1)
+            {
+                if (int8_uniform && 0)
+                {
+#if NCNN_RISCV_INT8_CONV_STATS
+                    double t0 = get_current_time();
+#endif
+                    int ret = quantize_to_int8_pack1(bottom_blob_fp32, bottom_blob_int8_pack1, bottom_blob_int8_scales[0], opt_g);
+#if NCNN_RISCV_INT8_CONV_STATS
+                    stats_quant_ms += get_current_time() - t0;
+                    stats_quant_calls += 1;
+#endif
+                    return ret;
+                }
+
+                Mat bottom_blob_fp32_pack1;
+                Option opt_pack1 = opt;
+                opt_pack1.blob_allocator = opt.workspace_allocator;
+
+#if NCNN_RISCV_INT8_CONV_STATS
+                double t0 = get_current_time();
+#endif
+                convert_packing(bottom_blob_fp32, bottom_blob_fp32_pack1, 1, opt_pack1);
+#if NCNN_RISCV_INT8_CONV_STATS
+                stats_pack_ms += get_current_time() - t0;
+                stats_pack_calls += 1;
+#endif
+                if (bottom_blob_fp32_pack1.empty())
+                    return -100;
+
+#if NCNN_RISCV_INT8_CONV_STATS
+                t0 = get_current_time();
+#endif
+                quantize_to_int8(bottom_blob_fp32_pack1, bottom_blob_int8_pack1, bottom_blob_int8_scales, opt_g);
+#if NCNN_RISCV_INT8_CONV_STATS
+                stats_quant_ms += get_current_time() - t0;
+                stats_quant_calls += 1;
+#endif
+                if (bottom_blob_int8_pack1.empty())
+                    return -100;
+#if NCNN_RISCV_INT8_CONV_DEBUG
+                static int g_rvv_int8_prep_warn = 0;
+                if (bottom_blob_int8_pack1.elempack != 1 && g_rvv_int8_prep_warn < 8)
+                {
+                    NCNN_LOGE("rvv int8 prep warn: fp32 input elempack=%d -> out elempack=%d",
+                              bottom_blob_fp32.elempack, bottom_blob_int8_pack1.elempack);
+                    g_rvv_int8_prep_warn++;
+                }
+#endif
+                return ensure_pack1(bottom_blob_int8_pack1);
+            }
+
+#if NCNN_RISCV_INT8_CONV_STATS
+            double t0 = get_current_time();
+#endif
+            quantize_to_int8(bottom_blob_fp32, bottom_blob_int8_pack1, bottom_blob_int8_scales, opt_g);
+#if NCNN_RISCV_INT8_CONV_STATS
+            stats_quant_ms += get_current_time() - t0;
+            stats_quant_calls += 1;
+#endif
+            if (bottom_blob_int8_pack1.empty())
+                return -100;
+#if NCNN_RISCV_INT8_CONV_DEBUG
+            static int g_rvv_int8_prep_warn = 0;
+            if (bottom_blob_int8_pack1.elempack != 1 && g_rvv_int8_prep_warn < 8)
+            {
+                NCNN_LOGE("rvv int8 prep warn: fp32 input elempack=%d -> out elempack=%d",
+                          bottom_blob_fp32.elempack, bottom_blob_int8_pack1.elempack);
+                g_rvv_int8_prep_warn++;
+            }
+#endif
+            return ensure_pack1(bottom_blob_int8_pack1);
+        };
+
+        const int disable_rvv_int8_conv = riscv_int8_conv_disabled();
+        const int disable_rvv_int8_conv1x1 = riscv_int8_conv1x1_disabled();
+        const int disable_rvv_int8_conv3x3 = riscv_int8_conv3x3_disabled();
+        const int disable_rvv_int8_conv3x3s1 = riscv_int8_conv3x3s1_disabled();
+        const int disable_rvv_int8_conv3x3s2 = riscv_int8_conv3x3s2_disabled();
+        const int disable_rvv_int8_prep = riscv_int8_conv_prep_disabled();
+        const int num_input = weight_data_size / num_output / (kernel_w * kernel_h);
+        const int channels_unpacked = bottom_blob_fp32.c * bottom_blob_fp32.elempack;
+        const bool fallback_dims3 = bottom_blob_fp32.dims == 3;
+        const bool fallback_dilation1 = dilation_w == 1 && dilation_h == 1;
+        const bool fallback_stride_1_or_2 = (stride_w == 1 && stride_h == 1) || (stride_w == 2 && stride_h == 2);
+        const bool fallback_kernel_1_or_3 = (kernel_w == 1 && kernel_h == 1) || (kernel_w == 3 && kernel_h == 3);
+        const bool fallback_group_or_channel_match = num_input == channels_unpacked;
+
+        if (!disable_rvv_int8_conv && !disable_rvv_int8_conv1x1 && !disable_rvv_int8_prep && int8_uniform && bottom_blob_fp32.dims == 3 && num_input == channels_unpacked && kernel_w == 1 && kernel_h == 1 && dilation_w == 1 && dilation_h == 1 && stride_w == 1 && stride_h == 1)
+        {
+            Mat bottom_blob_unbordered;
+            if (prepare_int8_pack1(bottom_blob_unbordered) != 0)
+                return -100;
+
+            Mat bottom_blob_bordered;
+            Option opt_pad = opt;
+            opt_pad.use_packing_layout = false;
+            make_padding(bottom_blob_unbordered, bottom_blob_bordered, opt_pad);
+            if (bottom_blob_bordered.empty())
+                return -100;
+
+            int w = bottom_blob_bordered.w;
+            int h = bottom_blob_bordered.h;
+            int channels = bottom_blob_bordered.c;
+
+            const int kernel_extent_w = dilation_w * (kernel_w - 1) + 1;
+            const int kernel_extent_h = dilation_h * (kernel_h - 1) + 1;
+
+            int outw = (w - kernel_extent_w) / stride_w + 1;
+            int outh = (h - kernel_extent_h) / stride_h + 1;
+
+            bool use_int8_requantize = int8_scale_term > 100;
+            size_t out_elemsize = use_int8_requantize ? 1u : 4u;
+
+            top_blob.create(outw, outh, num_output, out_elemsize, opt.blob_allocator);
+            if (top_blob.empty())
+                return -100;
+
+#if NCNN_RISCV_INT8_CONV_DEBUG
+            static int g_rvv_int8_conv1x1_seen = 0;
+            if (!g_rvv_int8_conv1x1_seen)
+            {
+                NCNN_LOGE("riscv int8 1x1 conv rvv fast path");
+                g_rvv_int8_conv1x1_seen = 1;
+            }
+            static int g_rvv_int8_conv1x1_info = 0;
+            if (!g_rvv_int8_conv1x1_info)
+            {
+                NCNN_LOGE("rvv int8 1x1 info w=%d h=%d c=%d elempack=%d num_input=%d wscale0=%f inscale0=%f w_elemsize=%zu",
+                          w, h, channels, bottom_blob_bordered.elempack, num_input,
+                          weight_data_int8_scales.empty() ? 0.f : weight_data_int8_scales[0],
+                          bottom_blob_int8_scales.empty() ? 0.f : bottom_blob_int8_scales[0],
+                          weight_data.elemsize);
+                g_rvv_int8_conv1x1_info = 1;
+            }
+            static int g_rvv_int8_conv1x1_check = 0;
+            static int g_rvv_int8_conv1x1_tail_check = 0;
+            static int g_rvv_int8_conv1x1_ref_check = 0;
+#endif
+
+            const int vlenb = csrr_vlenb();
+
+            #pragma omp parallel num_threads(opt.num_threads)
+            {
+                int* sums = riscv_get_sums_buffer((size_t)vlenb);
+
+                #pragma omp for
+                for (int p = 0; p < num_output; p++)
+                {
+                    Mat outc = top_blob.channel(p);
+                    const signed char* kptr = (const signed char*)weight_data + channels * p;
+
+                    float scale_in = 0.f;
+                    if (weight_data_int8_scales[p] != 0)
+                        scale_in = 1.f / (bottom_blob_int8_scales[0] * weight_data_int8_scales[p]);
+
+                    float bias = bias_term ? bias_data[p] : 0.f;
+                    float scale_out = use_int8_requantize ? top_blob_int8_scales[0] : 0.f;
+                    const int force_fma = riscv_int8_conv_force_fma();
+                    const int no_fma = riscv_int8_conv_no_fma();
+
+                    for (int i = 0; i < outh; i++)
+                    {
+                        if (use_int8_requantize)
+                        {
+                            signed char* outptr = outc.row<signed char>(i);
+
+                            for (int j = 0; j < outw; )
+                            {
+                                size_t vl = __riscv_vsetvl_e8m1(outw - j);
+                                vint32m4_t _sum = __riscv_vmv_v_x_i32m4(0, vl);
+
+                                for (int q = 0; q < channels; q++)
+                                {
+                                    const signed char* sptr = bottom_blob_bordered.channel(q).row<signed char>(i) + j;
+                                    vint8m1_t _val8 = __riscv_vle8_v_i8m1(sptr, vl);
+                                    vint16m2_t _val16 = __riscv_vsext_vf2_i16m2(_val8, vl);
+                                    _sum = __riscv_vwmacc_vx_i32m4(_sum, (short)kptr[q], _val16, vl);
+                                }
+
+                                __riscv_vse32_v_i32m4(sums, _sum, vl);
+
+                                for (size_t jj = 0; jj < vl; jj++)
+                                {
+                                    float sumfp32 = riscv_int8_conv_accum_fp32(sums[jj], scale_in, bias, bias_term, force_fma, no_fma);
+                                    sumfp32 = activation_ss(sumfp32, activation_type, activation_params);
+                                    outptr[j + jj] = float2int8_rvv(sumfp32 * scale_out);
+                                }
+
+                                j += vl;
+                            }
+                        }
+                        else
+                        {
+                            float* outptr = outc.row<float>(i);
+
+                            for (int j = 0; j < outw; )
+                            {
+                                size_t vl = __riscv_vsetvl_e8m1(outw - j);
+                                vint32m4_t _sum = __riscv_vmv_v_x_i32m4(0, vl);
+
+                                for (int q = 0; q < channels; q++)
+                                {
+                                    const signed char* sptr = bottom_blob_bordered.channel(q).row<signed char>(i) + j;
+                                    vint8m1_t _val8 = __riscv_vle8_v_i8m1(sptr, vl);
+                                    vint16m2_t _val16 = __riscv_vsext_vf2_i16m2(_val8, vl);
+                                    _sum = __riscv_vwmacc_vx_i32m4(_sum, (short)kptr[q], _val16, vl);
+                                }
+
+                                __riscv_vse32_v_i32m4(sums, _sum, vl);
+
+#if NCNN_RISCV_INT8_CONV_DEBUG
+                                if (!g_rvv_int8_conv1x1_check && p == 0 && i == 0 && j == 0)
+                                {
+                                    int sum_scalar = 0;
+                                    for (int q = 0; q < channels; q++)
+                                    {
+                                        const signed char* sptr0 = bottom_blob_bordered.channel(q).row<signed char>(i) + j;
+                                        sum_scalar += sptr0[0] * kptr[q];
+                                    }
+                                    NCNN_LOGE("rvv int8 1x1 check vec=%d scalar=%d scale_in=%f bias=%f",
+                                              sums[0], sum_scalar, scale_in, bias);
+                                    g_rvv_int8_conv1x1_check = 1;
+                                }
+                                if (!g_rvv_int8_conv1x1_tail_check && p == 0 && i == 0 && j + (int)vl == outw)
+                                {
+                                    int sum_scalar = 0;
+                                    int j_tail = outw - 1;
+                                    for (int q = 0; q < channels; q++)
+                                    {
+                                        const signed char* sptr0 = bottom_blob_bordered.channel(q).row<signed char>(i) + j_tail;
+                                        sum_scalar += sptr0[0] * kptr[q];
+                                    }
+                                    NCNN_LOGE("rvv int8 1x1 tail vec=%d scalar=%d j=%d",
+                                              sums[vl - 1], sum_scalar, j_tail);
+                                    g_rvv_int8_conv1x1_tail_check = 1;
+                                }
+#endif
+                                for (size_t jj = 0; jj < vl; jj++)
+                                {
+                                    float sumfp32 = riscv_int8_conv_accum_fp32(sums[jj], scale_in, bias, bias_term, force_fma, no_fma);
+                                    sumfp32 = activation_ss(sumfp32, activation_type, activation_params);
+                                    outptr[j + jj] = sumfp32;
+                                }
+
+                                j += vl;
+                            }
+                        }
+                    }
+                }
+            }
+
+#if NCNN_RISCV_INT8_CONV_STATS
+            stats_dump("rvv1x1");
+#endif
+#if NCNN_RISCV_INT8_CONV_DEBUG
+            if (g_rvv_int8_conv1x1_ref_check < 128)
+            {
+                Mat bottom_blob_ref = bottom_blob_fp32;
+                if (bottom_blob_ref.elempack != 1)
+                {
+                    Option opt_pack1 = opt;
+                    opt_pack1.blob_allocator = opt.workspace_allocator;
+                    convert_packing(bottom_blob_fp32, bottom_blob_ref, 1, opt_pack1);
+                }
+
+                Option opt_ref = opt;
+                opt_ref.use_packing_layout = false;
+                Mat top_blob_ref;
+                int ret = Convolution::forward_int8(bottom_blob_ref, top_blob_ref, opt_ref);
+                if (ret == 0 && top_blob_ref.elemsize == top_blob.elemsize)
+                {
+                    const size_t total = top_blob.total();
+                    float max_abs = 0.f;
+                    double mean_abs = 0.0;
+                    if (top_blob.elemsize == 4u)
+                    {
+                        const float* a = (const float*)top_blob.data;
+                        const float* b = (const float*)top_blob_ref.data;
+                        for (size_t i = 0; i < total; i++)
+                        {
+                            float d = fabsf(a[i] - b[i]);
+                            max_abs = std::max(max_abs, d);
+                            mean_abs += d;
+                        }
+                        mean_abs /= (double)total;
+                    }
+                    else if (top_blob.elemsize == 1u)
+                    {
+                        const signed char* a = (const signed char*)top_blob.data;
+                        const signed char* b = (const signed char*)top_blob_ref.data;
+                        for (size_t i = 0; i < total; i++)
+                        {
+                            float d = (float)abs((int)a[i] - (int)b[i]);
+                            max_abs = std::max(max_abs, d);
+                            mean_abs += d;
+                        }
+                        mean_abs /= (double)total;
+                    }
+                    NCNN_LOGE("rvv int8 1x1 refcheck[%d] name=%s max_abs=%f mean_abs=%f elems=%zu outw=%d outh=%d inch=%d inpack=%d outch=%d",
+                              g_rvv_int8_conv1x1_ref_check, name.c_str(), max_abs, (float)mean_abs, total,
+                              outw, outh, channels, bottom_blob_bordered.elempack, top_blob.c);
+                }
+                else
+                {
+                    NCNN_LOGE("rvv int8 1x1 refcheck[%d] skipped ret=%d ref_elemsize=%zu outw=%d outh=%d inch=%d inpack=%d outch=%d",
+                              g_rvv_int8_conv1x1_ref_check, ret, top_blob_ref.elemsize,
+                              outw, outh, channels, bottom_blob_bordered.elempack, top_blob.c);
+                }
+                g_rvv_int8_conv1x1_ref_check++;
+            }
+#endif
+            if (coverage_enabled)
+                g_riscv_int8_coverage_counters.conv_int8_pack1_1x1_fast_count.fetch_add(1, std::memory_order_relaxed);
+            return 0;
+        }
+
+        if (!disable_rvv_int8_conv && !disable_rvv_int8_conv3x3 && !disable_rvv_int8_conv3x3s1 && !disable_rvv_int8_prep && int8_uniform && bottom_blob_fp32.dims == 3 && num_input == channels_unpacked && kernel_w == 3 && kernel_h == 3 && dilation_w == 1 && dilation_h == 1 && stride_w == 1 && stride_h == 1)
+        {
+            Mat bottom_blob_unbordered;
+            if (prepare_int8_pack1(bottom_blob_unbordered) != 0)
+                return -100;
+
+            Mat bottom_blob_bordered;
+            Option opt_pad = opt;
+            opt_pad.use_packing_layout = false;
+            make_padding(bottom_blob_unbordered, bottom_blob_bordered, opt_pad);
+            if (bottom_blob_bordered.empty())
+                return -100;
+
+            int w = bottom_blob_bordered.w;
+            int h = bottom_blob_bordered.h;
+            int channels = bottom_blob_bordered.c;
+
+            const int kernel_extent_w = dilation_w * (kernel_w - 1) + 1;
+            const int kernel_extent_h = dilation_h * (kernel_h - 1) + 1;
+
+            int outw = (w - kernel_extent_w) / stride_w + 1;
+            int outh = (h - kernel_extent_h) / stride_h + 1;
+
+            bool use_int8_requantize = int8_scale_term > 100;
+            size_t out_elemsize = use_int8_requantize ? 1u : 4u;
+
+            top_blob.create(outw, outh, num_output, out_elemsize, opt.blob_allocator);
+            if (top_blob.empty())
+                return -100;
+
+#if NCNN_RISCV_INT8_CONV_DEBUG
+            static int g_rvv_int8_conv3x3s1_seen = 0;
+            if (!g_rvv_int8_conv3x3s1_seen)
+            {
+                NCNN_LOGE("riscv int8 3x3s1 conv rvv fast path");
+                g_rvv_int8_conv3x3s1_seen = 1;
+            }
+            static int g_rvv_int8_conv3x3s1_info = 0;
+            if (!g_rvv_int8_conv3x3s1_info)
+            {
+                NCNN_LOGE("rvv int8 3x3s1 info w=%d h=%d c=%d elempack=%d num_input=%d wscale0=%f inscale0=%f w_elemsize=%zu",
+                          w, h, channels, bottom_blob_bordered.elempack, num_input,
+                          weight_data_int8_scales.empty() ? 0.f : weight_data_int8_scales[0],
+                          bottom_blob_int8_scales.empty() ? 0.f : bottom_blob_int8_scales[0],
+                          weight_data.elemsize);
+                g_rvv_int8_conv3x3s1_info = 1;
+            }
+            static int g_rvv_int8_conv3x3s1_check = 0;
+            static int g_rvv_int8_conv3x3s1_tail_check = 0;
+            static int g_rvv_int8_conv3x3s1_ref_check = 0;
+#endif
+
+            const int vlenb = csrr_vlenb();
+
+            #pragma omp parallel num_threads(opt.num_threads)
+            {
+                int* sums = riscv_get_sums_buffer((size_t)vlenb);
+
+                #pragma omp for
+                for (int p = 0; p < num_output; p++)
+                {
+                    Mat outc = top_blob.channel(p);
+                    const signed char* kptr = (const signed char*)weight_data + channels * p * 9;
+
+                    float scale_in = 0.f;
+                    if (weight_data_int8_scales[p] != 0)
+                        scale_in = 1.f / (bottom_blob_int8_scales[0] * weight_data_int8_scales[p]);
+
+                    float bias = bias_term ? bias_data[p] : 0.f;
+                    float scale_out = use_int8_requantize ? top_blob_int8_scales[0] : 0.f;
+                    const int force_fma = riscv_int8_conv_force_fma();
+                    const int no_fma = riscv_int8_conv_no_fma();
+
+                    for (int i = 0; i < outh; i++)
+                    {
+                        int in_y = i * stride_h;
+
+                        if (use_int8_requantize)
+                        {
+                            signed char* outptr = outc.row<signed char>(i);
+
+                            for (int j = 0; j < outw; )
+                            {
+                                size_t vl = __riscv_vsetvl_e8m1(outw - j);
+                                vint32m4_t _sum = __riscv_vmv_v_x_i32m4(0, vl);
+
+                                for (int q = 0; q < channels; q++)
+                                {
+                                    const signed char* kptr_q = kptr + q * 9;
+
+                                    const signed char* r0 = bottom_blob_bordered.channel(q).row<signed char>(in_y + 0) + j;
+                                    const signed char* r1 = bottom_blob_bordered.channel(q).row<signed char>(in_y + 1) + j;
+                                    const signed char* r2 = bottom_blob_bordered.channel(q).row<signed char>(in_y + 2) + j;
+
+                                    vint8m1_t _r00 = __riscv_vle8_v_i8m1(r0 + 0, vl);
+                                    vint8m1_t _r01 = __riscv_vle8_v_i8m1(r0 + 1, vl);
+                                    vint8m1_t _r02 = __riscv_vle8_v_i8m1(r0 + 2, vl);
+                                    vint8m1_t _r10 = __riscv_vle8_v_i8m1(r1 + 0, vl);
+                                    vint8m1_t _r11 = __riscv_vle8_v_i8m1(r1 + 1, vl);
+                                    vint8m1_t _r12 = __riscv_vle8_v_i8m1(r1 + 2, vl);
+                                    vint8m1_t _r20 = __riscv_vle8_v_i8m1(r2 + 0, vl);
+                                    vint8m1_t _r21 = __riscv_vle8_v_i8m1(r2 + 1, vl);
+                                    vint8m1_t _r22 = __riscv_vle8_v_i8m1(r2 + 2, vl);
+
+                                    vint16m2_t _r00_16 = __riscv_vsext_vf2_i16m2(_r00, vl);
+                                    vint16m2_t _r01_16 = __riscv_vsext_vf2_i16m2(_r01, vl);
+                                    vint16m2_t _r02_16 = __riscv_vsext_vf2_i16m2(_r02, vl);
+                                    vint16m2_t _r10_16 = __riscv_vsext_vf2_i16m2(_r10, vl);
+                                    vint16m2_t _r11_16 = __riscv_vsext_vf2_i16m2(_r11, vl);
+                                    vint16m2_t _r12_16 = __riscv_vsext_vf2_i16m2(_r12, vl);
+                                    vint16m2_t _r20_16 = __riscv_vsext_vf2_i16m2(_r20, vl);
+                                    vint16m2_t _r21_16 = __riscv_vsext_vf2_i16m2(_r21, vl);
+                                    vint16m2_t _r22_16 = __riscv_vsext_vf2_i16m2(_r22, vl);
+
+                                    _sum = __riscv_vwmacc_vx_i32m4(_sum, (short)kptr_q[0], _r00_16, vl);
+                                    _sum = __riscv_vwmacc_vx_i32m4(_sum, (short)kptr_q[1], _r01_16, vl);
+                                    _sum = __riscv_vwmacc_vx_i32m4(_sum, (short)kptr_q[2], _r02_16, vl);
+                                    _sum = __riscv_vwmacc_vx_i32m4(_sum, (short)kptr_q[3], _r10_16, vl);
+                                    _sum = __riscv_vwmacc_vx_i32m4(_sum, (short)kptr_q[4], _r11_16, vl);
+                                    _sum = __riscv_vwmacc_vx_i32m4(_sum, (short)kptr_q[5], _r12_16, vl);
+                                    _sum = __riscv_vwmacc_vx_i32m4(_sum, (short)kptr_q[6], _r20_16, vl);
+                                    _sum = __riscv_vwmacc_vx_i32m4(_sum, (short)kptr_q[7], _r21_16, vl);
+                                    _sum = __riscv_vwmacc_vx_i32m4(_sum, (short)kptr_q[8], _r22_16, vl);
+                                }
+
+                                __riscv_vse32_v_i32m4(sums, _sum, vl);
+
+                                for (size_t jj = 0; jj < vl; jj++)
+                                {
+                                    float sumfp32 = riscv_int8_conv_accum_fp32(sums[jj], scale_in, bias, bias_term, force_fma, no_fma);
+                                    sumfp32 = activation_ss(sumfp32, activation_type, activation_params);
+                                    outptr[j + jj] = float2int8_rvv(sumfp32 * scale_out);
+                                }
+
+                                j += vl;
+                            }
+                        }
+                        else
+                        {
+                            float* outptr = outc.row<float>(i);
+
+                            for (int j = 0; j < outw; )
+                            {
+                                size_t vl = __riscv_vsetvl_e8m1(outw - j);
+                                vint32m4_t _sum = __riscv_vmv_v_x_i32m4(0, vl);
+
+                                for (int q = 0; q < channels; q++)
+                                {
+                                    const signed char* kptr_q = kptr + q * 9;
+
+                                    const signed char* r0 = bottom_blob_bordered.channel(q).row<signed char>(in_y + 0) + j;
+                                    const signed char* r1 = bottom_blob_bordered.channel(q).row<signed char>(in_y + 1) + j;
+                                    const signed char* r2 = bottom_blob_bordered.channel(q).row<signed char>(in_y + 2) + j;
+
+                                    vint8m1_t _r00 = __riscv_vle8_v_i8m1(r0 + 0, vl);
+                                    vint8m1_t _r01 = __riscv_vle8_v_i8m1(r0 + 1, vl);
+                                    vint8m1_t _r02 = __riscv_vle8_v_i8m1(r0 + 2, vl);
+                                    vint8m1_t _r10 = __riscv_vle8_v_i8m1(r1 + 0, vl);
+                                    vint8m1_t _r11 = __riscv_vle8_v_i8m1(r1 + 1, vl);
+                                    vint8m1_t _r12 = __riscv_vle8_v_i8m1(r1 + 2, vl);
+                                    vint8m1_t _r20 = __riscv_vle8_v_i8m1(r2 + 0, vl);
+                                    vint8m1_t _r21 = __riscv_vle8_v_i8m1(r2 + 1, vl);
+                                    vint8m1_t _r22 = __riscv_vle8_v_i8m1(r2 + 2, vl);
+
+                                    vint16m2_t _r00_16 = __riscv_vsext_vf2_i16m2(_r00, vl);
+                                    vint16m2_t _r01_16 = __riscv_vsext_vf2_i16m2(_r01, vl);
+                                    vint16m2_t _r02_16 = __riscv_vsext_vf2_i16m2(_r02, vl);
+                                    vint16m2_t _r10_16 = __riscv_vsext_vf2_i16m2(_r10, vl);
+                                    vint16m2_t _r11_16 = __riscv_vsext_vf2_i16m2(_r11, vl);
+                                    vint16m2_t _r12_16 = __riscv_vsext_vf2_i16m2(_r12, vl);
+                                    vint16m2_t _r20_16 = __riscv_vsext_vf2_i16m2(_r20, vl);
+                                    vint16m2_t _r21_16 = __riscv_vsext_vf2_i16m2(_r21, vl);
+                                    vint16m2_t _r22_16 = __riscv_vsext_vf2_i16m2(_r22, vl);
+
+                                    _sum = __riscv_vwmacc_vx_i32m4(_sum, (short)kptr_q[0], _r00_16, vl);
+                                    _sum = __riscv_vwmacc_vx_i32m4(_sum, (short)kptr_q[1], _r01_16, vl);
+                                    _sum = __riscv_vwmacc_vx_i32m4(_sum, (short)kptr_q[2], _r02_16, vl);
+                                    _sum = __riscv_vwmacc_vx_i32m4(_sum, (short)kptr_q[3], _r10_16, vl);
+                                    _sum = __riscv_vwmacc_vx_i32m4(_sum, (short)kptr_q[4], _r11_16, vl);
+                                    _sum = __riscv_vwmacc_vx_i32m4(_sum, (short)kptr_q[5], _r12_16, vl);
+                                    _sum = __riscv_vwmacc_vx_i32m4(_sum, (short)kptr_q[6], _r20_16, vl);
+                                    _sum = __riscv_vwmacc_vx_i32m4(_sum, (short)kptr_q[7], _r21_16, vl);
+                                    _sum = __riscv_vwmacc_vx_i32m4(_sum, (short)kptr_q[8], _r22_16, vl);
+                                }
+
+                                __riscv_vse32_v_i32m4(sums, _sum, vl);
+
+#if NCNN_RISCV_INT8_CONV_DEBUG
+                                if (!g_rvv_int8_conv3x3s1_check && p == 0 && i == 0 && j == 0)
+                                {
+                                    int sum_scalar = 0;
+                                    for (int q = 0; q < channels; q++)
+                                    {
+                                        const signed char* kptr_q = kptr + q * 9;
+                                        const signed char* r0 = bottom_blob_bordered.channel(q).row<signed char>(in_y + 0) + j;
+                                        const signed char* r1 = bottom_blob_bordered.channel(q).row<signed char>(in_y + 1) + j;
+                                        const signed char* r2 = bottom_blob_bordered.channel(q).row<signed char>(in_y + 2) + j;
+                                        sum_scalar += r0[0] * kptr_q[0];
+                                        sum_scalar += r0[1] * kptr_q[1];
+                                        sum_scalar += r0[2] * kptr_q[2];
+                                        sum_scalar += r1[0] * kptr_q[3];
+                                        sum_scalar += r1[1] * kptr_q[4];
+                                        sum_scalar += r1[2] * kptr_q[5];
+                                        sum_scalar += r2[0] * kptr_q[6];
+                                        sum_scalar += r2[1] * kptr_q[7];
+                                        sum_scalar += r2[2] * kptr_q[8];
+                                    }
+                                    NCNN_LOGE("rvv int8 3x3s1 check vec=%d scalar=%d scale_in=%f bias=%f",
+                                              sums[0], sum_scalar, scale_in, bias);
+                                    g_rvv_int8_conv3x3s1_check = 1;
+                                }
+                                if (!g_rvv_int8_conv3x3s1_tail_check && p == 0 && i == 0 && j + (int)vl == outw)
+                                {
+                                    int sum_scalar = 0;
+                                    int j_tail = outw - 1;
+                                    for (int q = 0; q < channels; q++)
+                                    {
+                                        const signed char* kptr_q = kptr + q * 9;
+                                        const signed char* r0 = bottom_blob_bordered.channel(q).row<signed char>(in_y + 0) + j_tail;
+                                        const signed char* r1 = bottom_blob_bordered.channel(q).row<signed char>(in_y + 1) + j_tail;
+                                        const signed char* r2 = bottom_blob_bordered.channel(q).row<signed char>(in_y + 2) + j_tail;
+                                        sum_scalar += r0[0] * kptr_q[0];
+                                        sum_scalar += r0[1] * kptr_q[1];
+                                        sum_scalar += r0[2] * kptr_q[2];
+                                        sum_scalar += r1[0] * kptr_q[3];
+                                        sum_scalar += r1[1] * kptr_q[4];
+                                        sum_scalar += r1[2] * kptr_q[5];
+                                        sum_scalar += r2[0] * kptr_q[6];
+                                        sum_scalar += r2[1] * kptr_q[7];
+                                        sum_scalar += r2[2] * kptr_q[8];
+                                    }
+                                    NCNN_LOGE("rvv int8 3x3s1 tail vec=%d scalar=%d j=%d",
+                                              sums[vl - 1], sum_scalar, j_tail);
+                                    g_rvv_int8_conv3x3s1_tail_check = 1;
+                                }
+#endif
+                                for (size_t jj = 0; jj < vl; jj++)
+                                {
+                                    float sumfp32 = riscv_int8_conv_accum_fp32(sums[jj], scale_in, bias, bias_term, force_fma, no_fma);
+                                    sumfp32 = activation_ss(sumfp32, activation_type, activation_params);
+                                    outptr[j + jj] = sumfp32;
+                                }
+
+                                j += vl;
+                            }
+                        }
+                    }
+                }
+            }
+
+#if NCNN_RISCV_INT8_CONV_STATS
+            stats_dump("rvv3x3s1");
+#endif
+#if NCNN_RISCV_INT8_CONV_DEBUG
+            auto refcheck_3x3s1 = [&](const char* tag)
+            {
+                Mat bottom_blob_ref = bottom_blob_fp32;
+                if (bottom_blob_ref.elempack != 1)
+                {
+                    Option opt_pack1 = opt;
+                    opt_pack1.blob_allocator = opt.workspace_allocator;
+                    convert_packing(bottom_blob_fp32, bottom_blob_ref, 1, opt_pack1);
+                }
+
+                Option opt_ref = opt;
+                opt_ref.use_packing_layout = false;
+                Mat top_blob_ref;
+                int ret = Convolution::forward_int8(bottom_blob_ref, top_blob_ref, opt_ref);
+                if (ret == 0 && top_blob_ref.elemsize == top_blob.elemsize)
+                {
+                    const size_t total = top_blob.total();
+                    float max_abs = 0.f;
+                    double mean_abs = 0.0;
+                    if (top_blob.elemsize == 4u)
+                    {
+                        const float* a = (const float*)top_blob.data;
+                        const float* b = (const float*)top_blob_ref.data;
+                        for (size_t i = 0; i < total; i++)
+                        {
+                            float d = fabsf(a[i] - b[i]);
+                            max_abs = std::max(max_abs, d);
+                            mean_abs += d;
+                        }
+                        mean_abs /= (double)total;
+                    }
+                    else if (top_blob.elemsize == 1u)
+                    {
+                        const signed char* a = (const signed char*)top_blob.data;
+                        const signed char* b = (const signed char*)top_blob_ref.data;
+                        for (size_t i = 0; i < total; i++)
+                        {
+                            float d = (float)abs((int)a[i] - (int)b[i]);
+                            max_abs = std::max(max_abs, d);
+                            mean_abs += d;
+                        }
+                        mean_abs /= (double)total;
+                    }
+                    NCNN_LOGE("rvv int8 3x3s1 refcheck[%s] name=%s max_abs=%f mean_abs=%f elems=%zu outw=%d outh=%d inch=%d inpack=%d outch=%d",
+                              tag, name.c_str(), max_abs, (float)mean_abs, total, outw, outh, channels, bottom_blob_bordered.elempack, num_output);
+                }
+                else
+                {
+                    NCNN_LOGE("rvv int8 3x3s1 refcheck[%s] skipped ret=%d ref_elemsize=%zu outw=%d outh=%d inch=%d inpack=%d outch=%d",
+                              tag, ret, top_blob_ref.elemsize, outw, outh, channels, bottom_blob_bordered.elempack, num_output);
+                }
+            };
+
+            if (g_rvv_int8_conv3x3s1_ref_check < 128)
+            {
+                char tag[16];
+                snprintf(tag, sizeof(tag), "idx%d", g_rvv_int8_conv3x3s1_ref_check);
+                refcheck_3x3s1(tag);
+                g_rvv_int8_conv3x3s1_ref_check++;
+            }
+#endif
+            if (coverage_enabled)
+                g_riscv_int8_coverage_counters.conv_int8_pack1_3x3s1_fast_count.fetch_add(1, std::memory_order_relaxed);
+            return 0;
+        }
+
+        if (!disable_rvv_int8_conv && !disable_rvv_int8_conv3x3 && !disable_rvv_int8_conv3x3s2 && !disable_rvv_int8_prep && int8_uniform && bottom_blob_fp32.dims == 3 && num_input == channels_unpacked && kernel_w == 3 && kernel_h == 3 && dilation_w == 1 && dilation_h == 1 && stride_w == 2 && stride_h == 2)
+        {
+            Mat bottom_blob_unbordered;
+            if (prepare_int8_pack1(bottom_blob_unbordered) != 0)
+                return -100;
+
+            Mat bottom_blob_bordered;
+            Option opt_pad = opt;
+            opt_pad.use_packing_layout = false;
+            make_padding(bottom_blob_unbordered, bottom_blob_bordered, opt_pad);
+            if (bottom_blob_bordered.empty())
+                return -100;
+
+            int w = bottom_blob_bordered.w;
+            int h = bottom_blob_bordered.h;
+            int channels = bottom_blob_bordered.c;
+
+            const int kernel_extent_w = dilation_w * (kernel_w - 1) + 1;
+            const int kernel_extent_h = dilation_h * (kernel_h - 1) + 1;
+
+            int outw = (w - kernel_extent_w) / stride_w + 1;
+            int outh = (h - kernel_extent_h) / stride_h + 1;
+
+            bool use_int8_requantize = int8_scale_term > 100;
+            size_t out_elemsize = use_int8_requantize ? 1u : 4u;
+
+            top_blob.create(outw, outh, num_output, out_elemsize, opt.blob_allocator);
+            if (top_blob.empty())
+                return -100;
+
+#if NCNN_RISCV_INT8_CONV_DEBUG
+            static int g_rvv_int8_conv3x3s2_seen = 0;
+            if (!g_rvv_int8_conv3x3s2_seen)
+            {
+                NCNN_LOGE("riscv int8 3x3s2 conv rvv fast path");
+                g_rvv_int8_conv3x3s2_seen = 1;
+            }
+            static int g_rvv_int8_conv3x3s2_info = 0;
+            if (!g_rvv_int8_conv3x3s2_info)
+            {
+                NCNN_LOGE("rvv int8 3x3s2 info w=%d h=%d c=%d elempack=%d num_input=%d wscale0=%f inscale0=%f w_elemsize=%zu",
+                          w, h, channels, bottom_blob_bordered.elempack, num_input,
+                          weight_data_int8_scales.empty() ? 0.f : weight_data_int8_scales[0],
+                          bottom_blob_int8_scales.empty() ? 0.f : bottom_blob_int8_scales[0],
+                          weight_data.elemsize);
+                g_rvv_int8_conv3x3s2_info = 1;
+            }
+            static int g_rvv_int8_conv3x3s2_check = 0;
+            static int g_rvv_int8_conv3x3s2_tail_check = 0;
+            static int g_rvv_int8_conv3x3s2_ref_check = 0;
+#endif
+
+            const int vlenb = csrr_vlenb();
+
+            #pragma omp parallel num_threads(opt.num_threads)
+            {
+                int* sums = riscv_get_sums_buffer((size_t)vlenb);
+
+                #pragma omp for
+                for (int p = 0; p < num_output; p++)
+                {
+                    Mat outc = top_blob.channel(p);
+                    const signed char* kptr = (const signed char*)weight_data + channels * p * 9;
+
+                    float scale_in = 0.f;
+                    if (weight_data_int8_scales[p] != 0)
+                        scale_in = 1.f / (bottom_blob_int8_scales[0] * weight_data_int8_scales[p]);
+
+                    float bias = bias_term ? bias_data[p] : 0.f;
+                    float scale_out = use_int8_requantize ? top_blob_int8_scales[0] : 0.f;
+                    const int force_fma = riscv_int8_conv_force_fma();
+                    const int no_fma = riscv_int8_conv_no_fma();
+
+                    for (int i = 0; i < outh; i++)
+                    {
+                        int in_y = i * stride_h;
+
+                        if (use_int8_requantize)
+                        {
+                            signed char* outptr = outc.row<signed char>(i);
+
+                            for (int j = 0; j < outw; )
+                            {
+                                size_t vl = __riscv_vsetvl_e8m1(outw - j);
+                                vint32m4_t _sum = __riscv_vmv_v_x_i32m4(0, vl);
+
+                                for (int q = 0; q < channels; q++)
+                                {
+                                    const signed char* kptr_q = kptr + q * 9;
+
+                                    const signed char* r0 = bottom_blob_bordered.channel(q).row<signed char>(in_y + 0) + j * 2;
+                                    const signed char* r1 = bottom_blob_bordered.channel(q).row<signed char>(in_y + 1) + j * 2;
+                                    const signed char* r2 = bottom_blob_bordered.channel(q).row<signed char>(in_y + 2) + j * 2;
+
+                                    vint8m1_t _r00 = __riscv_vlse8_v_i8m1(r0 + 0, 2, vl);
+                                    vint8m1_t _r01 = __riscv_vlse8_v_i8m1(r0 + 1, 2, vl);
+                                    vint8m1_t _r02 = __riscv_vlse8_v_i8m1(r0 + 2, 2, vl);
+                                    vint8m1_t _r10 = __riscv_vlse8_v_i8m1(r1 + 0, 2, vl);
+                                    vint8m1_t _r11 = __riscv_vlse8_v_i8m1(r1 + 1, 2, vl);
+                                    vint8m1_t _r12 = __riscv_vlse8_v_i8m1(r1 + 2, 2, vl);
+                                    vint8m1_t _r20 = __riscv_vlse8_v_i8m1(r2 + 0, 2, vl);
+                                    vint8m1_t _r21 = __riscv_vlse8_v_i8m1(r2 + 1, 2, vl);
+                                    vint8m1_t _r22 = __riscv_vlse8_v_i8m1(r2 + 2, 2, vl);
+
+                                    vint16m2_t _r00_16 = __riscv_vsext_vf2_i16m2(_r00, vl);
+                                    vint16m2_t _r01_16 = __riscv_vsext_vf2_i16m2(_r01, vl);
+                                    vint16m2_t _r02_16 = __riscv_vsext_vf2_i16m2(_r02, vl);
+                                    vint16m2_t _r10_16 = __riscv_vsext_vf2_i16m2(_r10, vl);
+                                    vint16m2_t _r11_16 = __riscv_vsext_vf2_i16m2(_r11, vl);
+                                    vint16m2_t _r12_16 = __riscv_vsext_vf2_i16m2(_r12, vl);
+                                    vint16m2_t _r20_16 = __riscv_vsext_vf2_i16m2(_r20, vl);
+                                    vint16m2_t _r21_16 = __riscv_vsext_vf2_i16m2(_r21, vl);
+                                    vint16m2_t _r22_16 = __riscv_vsext_vf2_i16m2(_r22, vl);
+
+                                    _sum = __riscv_vwmacc_vx_i32m4(_sum, (short)kptr_q[0], _r00_16, vl);
+                                    _sum = __riscv_vwmacc_vx_i32m4(_sum, (short)kptr_q[1], _r01_16, vl);
+                                    _sum = __riscv_vwmacc_vx_i32m4(_sum, (short)kptr_q[2], _r02_16, vl);
+                                    _sum = __riscv_vwmacc_vx_i32m4(_sum, (short)kptr_q[3], _r10_16, vl);
+                                    _sum = __riscv_vwmacc_vx_i32m4(_sum, (short)kptr_q[4], _r11_16, vl);
+                                    _sum = __riscv_vwmacc_vx_i32m4(_sum, (short)kptr_q[5], _r12_16, vl);
+                                    _sum = __riscv_vwmacc_vx_i32m4(_sum, (short)kptr_q[6], _r20_16, vl);
+                                    _sum = __riscv_vwmacc_vx_i32m4(_sum, (short)kptr_q[7], _r21_16, vl);
+                                    _sum = __riscv_vwmacc_vx_i32m4(_sum, (short)kptr_q[8], _r22_16, vl);
+                                }
+
+                                __riscv_vse32_v_i32m4(sums, _sum, vl);
+
+                                for (size_t jj = 0; jj < vl; jj++)
+                                {
+                                    float sumfp32 = riscv_int8_conv_accum_fp32(sums[jj], scale_in, bias, bias_term, force_fma, no_fma);
+                                    sumfp32 = activation_ss(sumfp32, activation_type, activation_params);
+                                    outptr[j + jj] = float2int8_rvv(sumfp32 * scale_out);
+                                }
+
+                                j += vl;
+                            }
+                        }
+                        else
+                        {
+                            float* outptr = outc.row<float>(i);
+
+                            for (int j = 0; j < outw; )
+                            {
+                                size_t vl = __riscv_vsetvl_e8m1(outw - j);
+                                vint32m4_t _sum = __riscv_vmv_v_x_i32m4(0, vl);
+
+                                for (int q = 0; q < channels; q++)
+                                {
+                                    const signed char* kptr_q = kptr + q * 9;
+
+                                    const signed char* r0 = bottom_blob_bordered.channel(q).row<signed char>(in_y + 0) + j * 2;
+                                    const signed char* r1 = bottom_blob_bordered.channel(q).row<signed char>(in_y + 1) + j * 2;
+                                    const signed char* r2 = bottom_blob_bordered.channel(q).row<signed char>(in_y + 2) + j * 2;
+
+                                    vint8m1_t _r00 = __riscv_vlse8_v_i8m1(r0 + 0, 2, vl);
+                                    vint8m1_t _r01 = __riscv_vlse8_v_i8m1(r0 + 1, 2, vl);
+                                    vint8m1_t _r02 = __riscv_vlse8_v_i8m1(r0 + 2, 2, vl);
+                                    vint8m1_t _r10 = __riscv_vlse8_v_i8m1(r1 + 0, 2, vl);
+                                    vint8m1_t _r11 = __riscv_vlse8_v_i8m1(r1 + 1, 2, vl);
+                                    vint8m1_t _r12 = __riscv_vlse8_v_i8m1(r1 + 2, 2, vl);
+                                    vint8m1_t _r20 = __riscv_vlse8_v_i8m1(r2 + 0, 2, vl);
+                                    vint8m1_t _r21 = __riscv_vlse8_v_i8m1(r2 + 1, 2, vl);
+                                    vint8m1_t _r22 = __riscv_vlse8_v_i8m1(r2 + 2, 2, vl);
+
+                                    vint16m2_t _r00_16 = __riscv_vsext_vf2_i16m2(_r00, vl);
+                                    vint16m2_t _r01_16 = __riscv_vsext_vf2_i16m2(_r01, vl);
+                                    vint16m2_t _r02_16 = __riscv_vsext_vf2_i16m2(_r02, vl);
+                                    vint16m2_t _r10_16 = __riscv_vsext_vf2_i16m2(_r10, vl);
+                                    vint16m2_t _r11_16 = __riscv_vsext_vf2_i16m2(_r11, vl);
+                                    vint16m2_t _r12_16 = __riscv_vsext_vf2_i16m2(_r12, vl);
+                                    vint16m2_t _r20_16 = __riscv_vsext_vf2_i16m2(_r20, vl);
+                                    vint16m2_t _r21_16 = __riscv_vsext_vf2_i16m2(_r21, vl);
+                                    vint16m2_t _r22_16 = __riscv_vsext_vf2_i16m2(_r22, vl);
+
+                                    _sum = __riscv_vwmacc_vx_i32m4(_sum, (short)kptr_q[0], _r00_16, vl);
+                                    _sum = __riscv_vwmacc_vx_i32m4(_sum, (short)kptr_q[1], _r01_16, vl);
+                                    _sum = __riscv_vwmacc_vx_i32m4(_sum, (short)kptr_q[2], _r02_16, vl);
+                                    _sum = __riscv_vwmacc_vx_i32m4(_sum, (short)kptr_q[3], _r10_16, vl);
+                                    _sum = __riscv_vwmacc_vx_i32m4(_sum, (short)kptr_q[4], _r11_16, vl);
+                                    _sum = __riscv_vwmacc_vx_i32m4(_sum, (short)kptr_q[5], _r12_16, vl);
+                                    _sum = __riscv_vwmacc_vx_i32m4(_sum, (short)kptr_q[6], _r20_16, vl);
+                                    _sum = __riscv_vwmacc_vx_i32m4(_sum, (short)kptr_q[7], _r21_16, vl);
+                                    _sum = __riscv_vwmacc_vx_i32m4(_sum, (short)kptr_q[8], _r22_16, vl);
+                                }
+
+                                __riscv_vse32_v_i32m4(sums, _sum, vl);
+
+#if NCNN_RISCV_INT8_CONV_DEBUG
+                                if (!g_rvv_int8_conv3x3s2_check && p == 0 && i == 0 && j == 0)
+                                {
+                                    int sum_scalar = 0;
+                                    for (int q = 0; q < channels; q++)
+                                    {
+                                        const signed char* kptr_q = kptr + q * 9;
+                                        const signed char* r0 = bottom_blob_bordered.channel(q).row<signed char>(in_y + 0) + j * 2;
+                                        const signed char* r1 = bottom_blob_bordered.channel(q).row<signed char>(in_y + 1) + j * 2;
+                                        const signed char* r2 = bottom_blob_bordered.channel(q).row<signed char>(in_y + 2) + j * 2;
+                                        sum_scalar += r0[0] * kptr_q[0];
+                                        sum_scalar += r0[1] * kptr_q[1];
+                                        sum_scalar += r0[2] * kptr_q[2];
+                                        sum_scalar += r1[0] * kptr_q[3];
+                                        sum_scalar += r1[1] * kptr_q[4];
+                                        sum_scalar += r1[2] * kptr_q[5];
+                                        sum_scalar += r2[0] * kptr_q[6];
+                                        sum_scalar += r2[1] * kptr_q[7];
+                                        sum_scalar += r2[2] * kptr_q[8];
+                                    }
+                                    NCNN_LOGE("rvv int8 3x3s2 check vec=%d scalar=%d scale_in=%f bias=%f",
+                                              sums[0], sum_scalar, scale_in, bias);
+                                    g_rvv_int8_conv3x3s2_check = 1;
+                                }
+                                if (!g_rvv_int8_conv3x3s2_tail_check && p == 0 && i == 0 && j + (int)vl == outw)
+                                {
+                                    int sum_scalar = 0;
+                                    int j_tail = outw - 1;
+                                    for (int q = 0; q < channels; q++)
+                                    {
+                                        const signed char* kptr_q = kptr + q * 9;
+                                        const signed char* r0 = bottom_blob_bordered.channel(q).row<signed char>(in_y + 0) + j_tail * 2;
+                                        const signed char* r1 = bottom_blob_bordered.channel(q).row<signed char>(in_y + 1) + j_tail * 2;
+                                        const signed char* r2 = bottom_blob_bordered.channel(q).row<signed char>(in_y + 2) + j_tail * 2;
+                                        sum_scalar += r0[0] * kptr_q[0];
+                                        sum_scalar += r0[1] * kptr_q[1];
+                                        sum_scalar += r0[2] * kptr_q[2];
+                                        sum_scalar += r1[0] * kptr_q[3];
+                                        sum_scalar += r1[1] * kptr_q[4];
+                                        sum_scalar += r1[2] * kptr_q[5];
+                                        sum_scalar += r2[0] * kptr_q[6];
+                                        sum_scalar += r2[1] * kptr_q[7];
+                                        sum_scalar += r2[2] * kptr_q[8];
+                                    }
+                                    NCNN_LOGE("rvv int8 3x3s2 tail vec=%d scalar=%d j=%d",
+                                              sums[vl - 1], sum_scalar, j_tail);
+                                    g_rvv_int8_conv3x3s2_tail_check = 1;
+                                }
+#endif
+                                for (size_t jj = 0; jj < vl; jj++)
+                                {
+                                    float sumfp32 = riscv_int8_conv_accum_fp32(sums[jj], scale_in, bias, bias_term, force_fma, no_fma);
+                                    sumfp32 = activation_ss(sumfp32, activation_type, activation_params);
+                                    outptr[j + jj] = sumfp32;
+                                }
+
+                                j += vl;
+                            }
+                        }
+                    }
+                }
+            }
+
+#if NCNN_RISCV_INT8_CONV_STATS
+            stats_dump("rvv3x3s2");
+#endif
+#if NCNN_RISCV_INT8_CONV_DEBUG
+            auto refcheck_3x3s2 = [&](const char* tag)
+            {
+                Mat bottom_blob_ref = bottom_blob_fp32;
+                if (bottom_blob_ref.elempack != 1)
+                {
+                    Option opt_pack1 = opt;
+                    opt_pack1.blob_allocator = opt.workspace_allocator;
+                    convert_packing(bottom_blob_fp32, bottom_blob_ref, 1, opt_pack1);
+                }
+
+                Option opt_ref = opt;
+                opt_ref.use_packing_layout = false;
+                Mat top_blob_ref;
+                int ret = Convolution::forward_int8(bottom_blob_ref, top_blob_ref, opt_ref);
+                if (ret == 0 && top_blob_ref.elemsize == top_blob.elemsize)
+                {
+                    const size_t total = top_blob.total();
+                    float max_abs = 0.f;
+                    double mean_abs = 0.0;
+                    if (top_blob.elemsize == 4u)
+                    {
+                        const float* a = (const float*)top_blob.data;
+                        const float* b = (const float*)top_blob_ref.data;
+                        for (size_t i = 0; i < total; i++)
+                        {
+                            float d = fabsf(a[i] - b[i]);
+                            max_abs = std::max(max_abs, d);
+                            mean_abs += d;
+                        }
+                        mean_abs /= (double)total;
+                    }
+                    else if (top_blob.elemsize == 1u)
+                    {
+                        const signed char* a = (const signed char*)top_blob.data;
+                        const signed char* b = (const signed char*)top_blob_ref.data;
+                        for (size_t i = 0; i < total; i++)
+                        {
+                            float d = (float)abs((int)a[i] - (int)b[i]);
+                            max_abs = std::max(max_abs, d);
+                            mean_abs += d;
+                        }
+                        mean_abs /= (double)total;
+                    }
+                    NCNN_LOGE("rvv int8 3x3s2 refcheck[%s] name=%s max_abs=%f mean_abs=%f elems=%zu outw=%d outh=%d inch=%d inpack=%d outch=%d",
+                              tag, name.c_str(), max_abs, (float)mean_abs, total, outw, outh, channels, bottom_blob_bordered.elempack, num_output);
+                }
+                else
+                {
+                    NCNN_LOGE("rvv int8 3x3s2 refcheck[%s] skipped ret=%d ref_elemsize=%zu outw=%d outh=%d inch=%d inpack=%d outch=%d",
+                              tag, ret, top_blob_ref.elemsize, outw, outh, channels, bottom_blob_bordered.elempack, num_output);
+                }
+            };
+
+            if (g_rvv_int8_conv3x3s2_ref_check < 128)
+            {
+                char tag[16];
+                snprintf(tag, sizeof(tag), "idx%d", g_rvv_int8_conv3x3s2_ref_check);
+                refcheck_3x3s2(tag);
+                g_rvv_int8_conv3x3s2_ref_check++;
+            }
+#endif
+            if (coverage_enabled)
+                g_riscv_int8_coverage_counters.conv_int8_pack1_3x3s2_fast_count.fetch_add(1, std::memory_order_relaxed);
+            return 0;
+        }
+#endif // __riscv_vector
+
+        Mat bottom_blob_unpacked_fp32 = bottom_blob_fp32;
+        if (bottom_blob_unpacked_fp32.elempack != 1)
         {
             Option opt_pack1 = opt;
             opt_pack1.blob_allocator = opt.workspace_allocator;
 
-            cast_float16_to_float32(bottom_blob_unpacked, bottom_blob_unpacked_fp32, opt_pack1);
+#if NCNN_RISCV_INT8_CONV_STATS
+            double t0 = get_current_time();
+#endif
+            convert_packing(bottom_blob_fp32, bottom_blob_unpacked_fp32, 1, opt_pack1);
+#if NCNN_RISCV_INT8_CONV_STATS
+            stats_pack_ms += get_current_time() - t0;
+            stats_pack_calls += 1;
+#endif
+            if (bottom_blob_unpacked_fp32.empty())
+                return -100;
         }
 
         Option opt_unpacked = opt;
         opt_unpacked.use_packing_layout = false;
+        if (coverage_enabled)
+        {
+            g_riscv_int8_coverage_counters.conv_int8_fallback_count.fetch_add(1, std::memory_order_relaxed);
+            if (!fallback_dims3)
+                g_riscv_int8_coverage_counters.fallback_reason_dims_ne3.fetch_add(1, std::memory_order_relaxed);
+            if (!fallback_dilation1)
+                g_riscv_int8_coverage_counters.fallback_reason_dilation_ne1.fetch_add(1, std::memory_order_relaxed);
+            if (!fallback_stride_1_or_2)
+                g_riscv_int8_coverage_counters.fallback_reason_stride_not_1_or_2.fetch_add(1, std::memory_order_relaxed);
+            if (!fallback_kernel_1_or_3)
+                g_riscv_int8_coverage_counters.fallback_reason_kernel_not_1_or_3.fetch_add(1, std::memory_order_relaxed);
+            if (!fallback_group_or_channel_match)
+                g_riscv_int8_coverage_counters.fallback_reason_group_or_channel_mismatch.fetch_add(1, std::memory_order_relaxed);
+            if (!int8_uniform)
+                g_riscv_int8_coverage_counters.fallback_reason_int8_uniform_false.fetch_add(1, std::memory_order_relaxed);
+            if (bottom_blob_fp32.elempack != 1)
+                g_riscv_int8_coverage_counters.fallback_reason_bottom_elempack_ne1.fetch_add(1, std::memory_order_relaxed);
+            if (disable_rvv_int8_conv)
+                g_riscv_int8_coverage_counters.fallback_reason_disable_global.fetch_add(1, std::memory_order_relaxed);
+            if (disable_rvv_int8_prep)
+                g_riscv_int8_coverage_counters.fallback_reason_disable_prep.fetch_add(1, std::memory_order_relaxed);
+            if (kernel_w == 1 && kernel_h == 1 && disable_rvv_int8_conv1x1)
+                g_riscv_int8_coverage_counters.fallback_reason_disable_1x1.fetch_add(1, std::memory_order_relaxed);
+            if (kernel_w == 3 && kernel_h == 3 && stride_w == 1 && stride_h == 1 && (disable_rvv_int8_conv3x3 || disable_rvv_int8_conv3x3s1))
+                g_riscv_int8_coverage_counters.fallback_reason_disable_3x3s1.fetch_add(1, std::memory_order_relaxed);
+            if (kernel_w == 3 && kernel_h == 3 && stride_w == 2 && stride_h == 2 && (disable_rvv_int8_conv3x3 || disable_rvv_int8_conv3x3s2))
+                g_riscv_int8_coverage_counters.fallback_reason_disable_3x3s2.fetch_add(1, std::memory_order_relaxed);
+        }
+#if NCNN_RISCV_INT8_CONV_STATS
+        stats_dump("fallback");
+#endif
         return Convolution::forward_int8(bottom_blob_unpacked_fp32, top_blob, opt_unpacked);
     }
 #endif

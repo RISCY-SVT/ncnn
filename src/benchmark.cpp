@@ -86,14 +86,14 @@ void sleep(unsigned long long int milliseconds)
 
 #if NCNN_BENCHMARK
 
-void benchmark(const Layer* layer, double start, double end)
+void benchmark(const Layer* layer, int layer_index, double start, double end)
 {
     fprintf(stderr, "%-24s %-30s %8.2lfms", layer->type.c_str(), layer->name.c_str(), end - start);
-    fprintf(stderr, "    |");
+    fprintf(stderr, "    | idx=%d", layer_index);
     fprintf(stderr, "\n");
 }
 
-void benchmark(const Layer* layer, const Mat& bottom_blob, Mat& top_blob, double start, double end)
+void benchmark(const Layer* layer, int layer_index, const Mat& bottom_blob, Mat& top_blob, double start, double end)
 {
     fprintf(stderr, "%-24s %-30s %8.2lfms", layer->type.c_str(), layer->name.c_str(), end - start);
 
@@ -134,7 +134,7 @@ void benchmark(const Layer* layer, const Mat& bottom_blob, Mat& top_blob, double
         sprintf(out_shape_str, "[%3d, %3d, %3d, %3d *%d]", top_blob.w, top_blob.h, top_blob.d, top_blob.c, top_blob.elempack);
     }
 
-    fprintf(stderr, "    | %22s -> %-22s", in_shape_str, out_shape_str);
+    fprintf(stderr, "    | %22s -> %-22s idx=%d", in_shape_str, out_shape_str, layer_index);
 
     if (layer->type == "Convolution")
     {

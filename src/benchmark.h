@@ -18,8 +18,8 @@ NCNN_EXPORT void sleep(unsigned long long int milliseconds = 1000);
 
 #if NCNN_BENCHMARK
 
-NCNN_EXPORT void benchmark(const Layer* layer, double start, double end);
-NCNN_EXPORT void benchmark(const Layer* layer, const Mat& bottom_blob, Mat& top_blob, double start, double end);
+NCNN_EXPORT void benchmark(const Layer* layer, int layer_index, double start, double end);
+NCNN_EXPORT void benchmark(const Layer* layer, int layer_index, const Mat& bottom_blob, Mat& top_blob, double start, double end);
 
 #endif // NCNN_BENCHMARK
 

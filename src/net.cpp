@@ -11,6 +11,8 @@
 
 #include <stdarg.h>
 #include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #if NCNN_BENCHMARK
@@ -23,6 +25,339 @@
 #endif // NCNN_VULKAN
 
 namespace ncnn {
+
+#if NCNN_BENCHMARK
+struct TraceMatInfo
+{
+    int dims;
+    int w;
+    int h;
+    int d;
+    int c;
+    int elempack;
+    int elembits;
+    size_t elemsize;
+    size_t cstep;
+    const void* data;
+    const void* allocator;
+};
+
+static inline TraceMatInfo trace_from_mat(const Mat& m)
+{
+    TraceMatInfo t;
+    t.dims = m.dims;
+    t.w = m.w;
+    t.h = m.h;
+    t.d = m.d;
+    t.c = m.c;
+    t.elempack = m.elempack;
+    t.elembits = m.elembits();
+    t.elemsize = m.elemsize;
+    t.cstep = m.cstep;
+    t.data = m.data;
+    t.allocator = m.allocator;
+    return t;
+}
+
+static inline size_t trace_scalar_count(const TraceMatInfo& t)
+{
+    if (t.dims == 1) return (size_t)t.w * t.elempack;
+    if (t.dims == 2) return (size_t)t.w * t.h * t.elempack;
+    if (t.dims == 3) return (size_t)t.w * t.h * t.c * t.elempack;
+    if (t.dims == 4) return (size_t)t.w * t.h * t.d * t.c * t.elempack;
+    return 0;
+}
+
+static inline size_t trace_bytes_scalar(const TraceMatInfo& t)
+{
+    return t.elempack ? t.elemsize / (size_t)t.elempack : 0;
+}
+
+static inline size_t trace_packed_count(const TraceMatInfo& t)
+{
+    size_t sc = trace_scalar_count(t);
+    return t.elempack ? sc / (size_t)t.elempack : 0;
+}
+
+static inline size_t trace_bytes_total(const TraceMatInfo& t)
+{
+    return trace_scalar_count(t) * trace_bytes_scalar(t);
+}
+
+static inline unsigned long long trace_ptr_u64(const void* p)
+{
+    return (unsigned long long)(uintptr_t)p;
+}
+
+static inline int bench_trace_enabled()
+{
+    static int enabled = []() -> int
+    {
+        const char* env = getenv("NCNN_BENCH_TRACE");
+        return (env && env[0] != '\0' && env[0] != '0') ? 1 : 0;
+    }();
+    return enabled;
+}
+
+static inline int bench_trace_convert_enabled()
+{
+    static int enabled = []() -> int
+    {
+        const char* env = getenv("NCNN_BENCH_TRACE_CONVERT");
+        return (env && env[0] != '\0' && env[0] != '0') ? 1 : 0;
+    }();
+    return enabled;
+}
+
+static inline int bench_trace_caps_enabled()
+{
+    static int enabled = []() -> int
+    {
+        const char* env = getenv("NCNN_BENCH_TRACE_CAPS");
+        return (env && env[0] != '\0' && env[0] != '0') ? 1 : 0;
+    }();
+    return enabled;
+}
+
+static inline int bench_profile_convert_enabled()
+{
+    static int enabled = []() -> int
+    {
+        const char* env = getenv("NCNN_BENCH_PROFILE_CONVERT");
+        return (env && env[0] != '\0' && env[0] != '0') ? 1 : 0;
+    }();
+    return enabled;
+}
+
+static inline int bench_trace_dump_all()
+{
+    static int enabled = []() -> int
+    {
+        const char* env = getenv("NCNN_BENCH_TRACE_DUMP_ALL");
+        return (env && env[0] != '\0' && env[0] != '0') ? 1 : 0;
+    }();
+    return enabled;
+}
+
+static inline const char* bench_trace_filter()
+{
+    const char* env = getenv("NCNN_BENCH_TRACE_FILTER");
+    return env ? env : "";
+}
+
+static inline int bench_is_memops_layer(const Layer* layer)
+{
+    const std::string& t = layer->type;
+    return t == "Slice" || t == "Split" || t == "Concat" || t == "Packing" || t == "ConvertPacking" || t == "Reshape" || t == "Permute" || t == "Crop";
+}
+
+static inline int bench_trace_match_idx_list(const char* f, int layer_index)
+{
+    if (!f || strncmp(f, "idx:", 4) != 0)
+        return 0;
+    const char* p = f + 4;
+    while (*p)
+    {
+        while (*p == ' ' || *p == '\t')
+            p++;
+        if (!*p)
+            break;
+        char* end = 0;
+        long start = strtol(p, &end, 10);
+        if (end == p)
+            break;
+        long finish = start;
+        if (*end == '-')
+        {
+            p = end + 1;
+            finish = strtol(p, &end, 10);
+            if (end == p)
+                finish = start;
+        }
+        if (layer_index >= (int)start && layer_index <= (int)finish)
+            return 1;
+        p = end;
+        if (*p == ',')
+            p++;
+    }
+    return 0;
+}
+
+static inline int bench_trace_match(const Layer* layer, int layer_index)
+{
+    if (!bench_trace_enabled())
+        return 0;
+    if (bench_trace_dump_all())
+        return 1;
+    const char* f = bench_trace_filter();
+    if (!f || f[0] == '\0')
+        return 1;
+    if (strncmp(f, "idx:", 4) == 0)
+        return bench_trace_match_idx_list(f, layer_index);
+    if (strcmp(f, "memops") == 0)
+        return bench_is_memops_layer(layer);
+    return strstr(layer->type.c_str(), f) || strstr(layer->name.c_str(), f);
+}
+
+static inline void bench_trace_header(const Option& opt)
+{
+    static int printed = 0;
+    if (printed)
+        return;
+    printed = 1;
+    fprintf(stderr,
+            "TRACE_HEADER lightmode=%d num_threads=%d use_fp16_packed=%d use_fp16_storage=%d use_fp16_arithmetic=%d "
+            "use_fp16_uniform=%d use_bf16_storage=%d use_int8_storage=%d use_int8_arithmetic=%d use_packing_layout=%d "
+            "trace_filter=%s trace_dump_all=%d trace_convert=%d trace_caps=%d profile_convert=%d\n",
+            opt.lightmode ? 1 : 0, opt.num_threads,
+            opt.use_fp16_packed ? 1 : 0, opt.use_fp16_storage ? 1 : 0, opt.use_fp16_arithmetic ? 1 : 0,
+            opt.use_fp16_uniform ? 1 : 0, opt.use_bf16_storage ? 1 : 0,
+            opt.use_int8_storage ? 1 : 0, opt.use_int8_arithmetic ? 1 : 0,
+            opt.use_packing_layout ? 1 : 0, bench_trace_filter(), bench_trace_dump_all(),
+            bench_trace_convert_enabled(), bench_trace_caps_enabled(), bench_profile_convert_enabled());
+}
+
+static inline void bench_trace_layer(int layer_index, const Layer* layer,
+                                     const std::vector<int>& bottom_ids, const std::vector<int>& top_ids,
+                                     const std::vector<TraceMatInfo>& bottoms, const std::vector<TraceMatInfo>& tops)
+{
+    fprintf(stderr, "TRACE layer_index=%d layer_type=%s layer_name=%s bottoms=%d tops=%d",
+            layer_index, layer->type.c_str(), layer->name.c_str(),
+            (int)bottoms.size(), (int)tops.size());
+
+    fprintf(stderr, " bottom_ids=");
+    for (size_t i = 0; i < bottom_ids.size(); i++)
+    {
+        if (i) fprintf(stderr, ",");
+        fprintf(stderr, "%d", bottom_ids[i]);
+    }
+    fprintf(stderr, " top_ids=");
+    for (size_t i = 0; i < top_ids.size(); i++)
+    {
+        if (i) fprintf(stderr, ",");
+        fprintf(stderr, "%d", top_ids[i]);
+    }
+
+    for (size_t i = 0; i < bottoms.size(); i++)
+    {
+        const TraceMatInfo& t = bottoms[i];
+        fprintf(stderr,
+                " b%zu.dims=%d b%zu.w=%d b%zu.h=%d b%zu.d=%d b%zu.c=%d b%zu.elemsize=%zu b%zu.elempack=%d"
+                " b%zu.bytes_scalar=%zu b%zu.scalar_count=%zu b%zu.packed_count=%zu b%zu.bytes_total=%zu"
+                " b%zu.data_ptr=0x%llx b%zu.cstep=%zu b%zu.alloc_ptr=0x%llx",
+                i, t.dims, i, t.w, i, t.h, i, t.d, i, t.c, i, t.elemsize, i, t.elempack,
+                i, trace_bytes_scalar(t), i, trace_scalar_count(t), i, trace_packed_count(t), i, trace_bytes_total(t),
+                i, trace_ptr_u64(t.data), i, t.cstep, i, trace_ptr_u64(t.allocator));
+    }
+    for (size_t i = 0; i < tops.size(); i++)
+    {
+        const TraceMatInfo& t = tops[i];
+        fprintf(stderr,
+                " t%zu.dims=%d t%zu.w=%d t%zu.h=%d t%zu.d=%d t%zu.c=%d t%zu.elemsize=%zu t%zu.elempack=%d"
+                " t%zu.bytes_scalar=%zu t%zu.scalar_count=%zu t%zu.packed_count=%zu t%zu.bytes_total=%zu"
+                " t%zu.data_ptr=0x%llx t%zu.cstep=%zu t%zu.alloc_ptr=0x%llx",
+                i, t.dims, i, t.w, i, t.h, i, t.d, i, t.c, i, t.elemsize, i, t.elempack,
+                i, trace_bytes_scalar(t), i, trace_scalar_count(t), i, trace_packed_count(t), i, trace_bytes_total(t),
+                i, trace_ptr_u64(t.data), i, t.cstep, i, trace_ptr_u64(t.allocator));
+    }
+
+    fprintf(stderr, "\n");
+}
+
+static inline void bench_trace_caps(int layer_index, const Layer* layer)
+{
+    if (!bench_trace_caps_enabled())
+        return;
+    static std::vector<int> printed;
+    if ((int)printed.size() <= layer_index)
+        printed.resize(layer_index + 1, 0);
+    if (printed[layer_index])
+        return;
+    printed[layer_index] = 1;
+    fprintf(stderr,
+            "LAYER_CAPS layer_index=%d layer_type=%s layer_name=%s one_blob_only=%d support_inplace=%d "
+            "support_packing=%d support_any_packing=%d support_fp16_storage=%d support_bf16_storage=%d support_int8_storage=%d\n",
+            layer_index, layer->type.c_str(), layer->name.c_str(),
+            layer->one_blob_only ? 1 : 0, layer->support_inplace ? 1 : 0,
+            layer->support_packing ? 1 : 0, layer->support_any_packing ? 1 : 0,
+            layer->support_fp16_storage ? 1 : 0, layer->support_bf16_storage ? 1 : 0, layer->support_int8_storage ? 1 : 0);
+}
+
+static thread_local int g_bench_layer_index = -1;
+static thread_local const Layer* g_bench_layer = 0;
+static thread_local int g_bench_blob_id = -1;
+static thread_local double g_bench_convert_ms = 0.0;
+static thread_local double g_bench_forward_ms = 0.0;
+
+static inline void bench_trace_set_layer(const Layer* layer, int layer_index)
+{
+    g_bench_layer = layer;
+    g_bench_layer_index = layer_index;
+}
+
+static inline void bench_trace_set_blob_id(int blob_id)
+{
+    g_bench_blob_id = blob_id;
+}
+
+static inline void bench_profile_reset()
+{
+    g_bench_convert_ms = 0.0;
+    g_bench_forward_ms = 0.0;
+}
+
+static inline void bench_profile_add_convert(double ms)
+{
+    g_bench_convert_ms += ms;
+}
+
+static inline void bench_profile_set_forward(double ms)
+{
+    g_bench_forward_ms = ms;
+}
+
+static inline void bench_profile_emit(const Layer* layer, int layer_index, double total_ms)
+{
+    if (!bench_profile_convert_enabled())
+        return;
+    double convert_ms = g_bench_convert_ms;
+    double forward_ms = g_bench_forward_ms;
+    double share = total_ms > 0.0 ? (convert_ms / total_ms) : 0.0;
+    fprintf(stderr,
+            "PROFILE_CONVERT layer_index=%d layer_type=%s layer_name=%s total_ms=%.6f convert_ms=%.6f forward_ms=%.6f convert_share=%.6f\n",
+            layer_index, layer->type.c_str(), layer->name.c_str(),
+            total_ms, convert_ms, forward_ms, share);
+}
+
+static inline void bench_trace_mat_kv(const char* tag, const TraceMatInfo& t)
+{
+    fprintf(stderr,
+            " %s.dims=%d %s.w=%d %s.h=%d %s.d=%d %s.c=%d %s.elempack=%d %s.elemsize=%zu %s.elembits=%d"
+            " %s.bytes_scalar=%zu %s.scalar_count=%zu %s.packed_count=%zu %s.bytes_total=%zu"
+            " %s.data_ptr=0x%llx %s.cstep=%zu %s.alloc_ptr=0x%llx",
+            tag, t.dims, tag, t.w, tag, t.h, tag, t.d, tag, t.c, tag, t.elempack, tag, t.elemsize, tag, t.elembits,
+            tag, trace_bytes_scalar(t), tag, trace_scalar_count(t), tag, trace_packed_count(t), tag, trace_bytes_total(t),
+            tag, trace_ptr_u64(t.data), tag, t.cstep, tag, trace_ptr_u64(t.allocator));
+}
+
+static inline void bench_trace_convert_event(const char* op_kind, const TraceMatInfo& src, const TraceMatInfo& dst)
+{
+    if (!bench_trace_enabled() || !bench_trace_convert_enabled())
+        return;
+    if (!g_bench_layer)
+        return;
+    if (!bench_trace_match(g_bench_layer, g_bench_layer_index))
+        return;
+    fprintf(stderr, "TRACE_CONVERT layer_index=%d layer_type=%s layer_name=%s blob_id=%d op_kind=%s",
+            g_bench_layer_index, g_bench_layer->type.c_str(), g_bench_layer->name.c_str(), g_bench_blob_id, op_kind);
+    bench_trace_mat_kv("src", src);
+    bench_trace_mat_kv("dst", dst);
+    fprintf(stderr, " bytes_in=%zu bytes_out=%zu src_ptr=0x%llx dst_ptr=0x%llx src_alloc_ptr=0x%llx dst_alloc_ptr=0x%llx\n",
+            trace_bytes_total(src), trace_bytes_total(dst),
+            trace_ptr_u64(src.data), trace_ptr_u64(dst.data),
+            trace_ptr_u64(src.allocator), trace_ptr_u64(dst.allocator));
+}
+#endif // NCNN_BENCHMARK
 
 class NetPrivate
 {
@@ -185,6 +520,9 @@ int NetPrivate::forward_layer(int layer_index, std::vector<Mat>& blob_mats, cons
 #if NCNN_BENCHMARK
     double start = get_current_time();
     Mat bottom_blob;
+    std::vector<int> trace_bottom_ids;
+    std::vector<int> trace_top_ids;
+    std::vector<TraceMatInfo> trace_bottoms;
     if (layer->one_blob_only)
     {
         int bottom_blob_index = layer->bottoms[0];
@@ -196,6 +534,22 @@ int NetPrivate::forward_layer(int layer_index, std::vector<Mat>& blob_mats, cons
         bottom_blob.elempack = blob_mats[bottom_blob_index].elempack;
         bottom_blob.elemsize = blob_mats[bottom_blob_index].elemsize;
     }
+    bench_trace_set_layer(layer, layer_index);
+    if (bench_profile_convert_enabled())
+        bench_profile_reset();
+    int trace_enabled = bench_trace_match(layer, layer_index);
+    if (trace_enabled)
+    {
+        bench_trace_header(opt);
+        trace_bottom_ids = layer->bottoms;
+        trace_top_ids = layer->tops;
+        trace_bottoms.reserve(trace_bottom_ids.size());
+        for (size_t i = 0; i < trace_bottom_ids.size(); i++)
+        {
+            trace_bottoms.push_back(trace_from_mat(blob_mats[trace_bottom_ids[i]]));
+        }
+    }
+    bench_trace_caps(layer_index, layer);
 #endif
     int ret = 0;
     if (layer->featmask)
@@ -211,11 +565,22 @@ int NetPrivate::forward_layer(int layer_index, std::vector<Mat>& blob_mats, cons
     if (layer->one_blob_only)
     {
         int top_blob_index = layer->tops[0];
-        benchmark(layer, bottom_blob, blob_mats[top_blob_index], start, end);
+        benchmark(layer, layer_index, bottom_blob, blob_mats[top_blob_index], start, end);
     }
     else
     {
-        benchmark(layer, start, end);
+        benchmark(layer, layer_index, start, end);
+    }
+    bench_profile_emit(layer, layer_index, end - start);
+    if (trace_enabled)
+    {
+        std::vector<TraceMatInfo> trace_tops;
+        trace_tops.reserve(trace_top_ids.size());
+        for (size_t i = 0; i < trace_top_ids.size(); i++)
+        {
+            trace_tops.push_back(trace_from_mat(blob_mats[trace_top_ids[i]]));
+        }
+        bench_trace_layer(layer_index, layer, trace_bottom_ids, trace_top_ids, trace_bottoms, trace_tops);
     }
 #endif
     if (ret != 0)
@@ -353,11 +718,11 @@ int NetPrivate::forward_layer(int layer_index, std::vector<Mat>& blob_mats, std:
         if (layer->one_blob_only)
         {
             int top_blob_index = layer->tops[0];
-            benchmark(layer, bottom_blob, blob_mats[top_blob_index], start, end);
+            benchmark(layer, layer_index, bottom_blob, blob_mats[top_blob_index], start, end);
         }
         else
         {
-            benchmark(layer, start, end);
+            benchmark(layer, layer_index, start, end);
         }
 #endif
     }
@@ -401,8 +766,17 @@ int NetPrivate::convert_layout(Mat& bottom_blob, const Layer* layer, const Optio
 #if NCNN_ZFH
         if (opt.use_fp16_storage && (ncnn::cpu_support_riscv_zvfh() || (!ncnn::cpu_support_riscv_v() && ncnn::cpu_support_riscv_zfh())) && layer->support_fp16_storage)
         {
+#if NCNN_BENCHMARK
+            TraceMatInfo src = trace_from_mat(bottom_blob);
+#endif
             Mat bottom_blob_fp16;
             cast_float32_to_float16(bottom_blob, bottom_blob_fp16, opt);
+            if (bottom_blob_fp16.empty())
+                return -100;
+#if NCNN_BENCHMARK
+            TraceMatInfo dst = trace_from_mat(bottom_blob_fp16);
+            bench_trace_convert_event("cast_fp32_to_fp16", src, dst);
+#endif
             bottom_blob = bottom_blob_fp16;
         }
         else
@@ -410,8 +784,17 @@ int NetPrivate::convert_layout(Mat& bottom_blob, const Layer* layer, const Optio
 #if NCNN_BF16
         if (opt.use_bf16_storage && layer->support_bf16_storage)
         {
+#if NCNN_BENCHMARK
+            TraceMatInfo src = trace_from_mat(bottom_blob);
+#endif
             Mat bottom_blob_bf16;
             cast_float32_to_bfloat16(bottom_blob, bottom_blob_bf16, opt);
+            if (bottom_blob_bf16.empty())
+                return -100;
+#if NCNN_BENCHMARK
+            TraceMatInfo dst = trace_from_mat(bottom_blob_bf16);
+            bench_trace_convert_event("cast_fp32_to_bf16", src, dst);
+#endif
             bottom_blob = bottom_blob_bf16;
         }
         else
@@ -501,8 +884,17 @@ int NetPrivate::convert_layout(Mat& bottom_blob, const Layer* layer, const Optio
 
     if (bottom_blob.elempack != dst_elempack)
     {
+#if NCNN_BENCHMARK
+        TraceMatInfo src = trace_from_mat(bottom_blob);
+#endif
         Mat bottom_blob_packed;
         convert_packing(bottom_blob, bottom_blob_packed, dst_elempack, opt);
+        if (bottom_blob_packed.empty())
+            return -100;
+#if NCNN_BENCHMARK
+        TraceMatInfo dst = trace_from_mat(bottom_blob_packed);
+        bench_trace_convert_event("repack", src, dst);
+#endif
         bottom_blob = bottom_blob_packed;
 
         if (bottom_blob.empty())
@@ -535,8 +927,17 @@ int NetPrivate::convert_layout(Mat& bottom_blob, const Layer* layer, const Optio
 #if NCNN_ZFH
         if (opt.use_fp16_storage && (ncnn::cpu_support_riscv_zvfh() || (!ncnn::cpu_support_riscv_v() && ncnn::cpu_support_riscv_zfh())) && !layer->support_fp16_storage)
         {
+#if NCNN_BENCHMARK
+            TraceMatInfo src = trace_from_mat(bottom_blob);
+#endif
             Mat bottom_blob_fp32;
             cast_float16_to_float32(bottom_blob, bottom_blob_fp32, opt);
+            if (bottom_blob_fp32.empty())
+                return -100;
+#if NCNN_BENCHMARK
+            TraceMatInfo dst = trace_from_mat(bottom_blob_fp32);
+            bench_trace_convert_event("cast_fp16_to_fp32", src, dst);
+#endif
             bottom_blob = bottom_blob_fp32;
         }
         else
@@ -544,8 +945,17 @@ int NetPrivate::convert_layout(Mat& bottom_blob, const Layer* layer, const Optio
 #if NCNN_BF16
         if (opt.use_bf16_storage && !layer->support_bf16_storage)
         {
+#if NCNN_BENCHMARK
+            TraceMatInfo src = trace_from_mat(bottom_blob);
+#endif
             Mat bottom_blob_fp32;
             cast_bfloat16_to_float32(bottom_blob, bottom_blob_fp32, opt);
+            if (bottom_blob_fp32.empty())
+                return -100;
+#if NCNN_BENCHMARK
+            TraceMatInfo dst = trace_from_mat(bottom_blob_fp32);
+            bench_trace_convert_event("cast_bf16_to_fp32", src, dst);
+#endif
             bottom_blob = bottom_blob_fp32;
         }
         else
@@ -628,11 +1038,39 @@ int NetPrivate::do_forward_layer(const Layer* layer, std::vector<Mat>& blob_mats
             bottom_blob = bottom_blob_ref;
         }
 
+#if NCNN_BENCHMARK
+        const int profile_enabled = bench_profile_convert_enabled();
+        if (profile_enabled)
+        {
+            double t0 = get_current_time();
+            bench_trace_set_blob_id(bottom_blob_index);
+            int ret = convert_layout(bottom_blob, layer, opt);
+            double t1 = get_current_time();
+            bench_profile_add_convert(t1 - t0);
+            bench_trace_set_blob_id(-1);
+            if (ret != 0)
+                return ret;
+        }
+        else
+        {
+            bench_trace_set_blob_id(bottom_blob_index);
+            int ret = convert_layout(bottom_blob, layer, opt);
+            bench_trace_set_blob_id(-1);
+            if (ret != 0)
+                return ret;
+        }
+#else
         int ret = convert_layout(bottom_blob, layer, opt);
         if (ret != 0)
             return ret;
+#endif
 
         // forward
+#if NCNN_BENCHMARK
+        double f0 = 0.0;
+        if (profile_enabled)
+            f0 = get_current_time();
+#endif
         if (opt.lightmode && layer->support_inplace)
         {
             Mat& bottom_top_blob = bottom_blob;
@@ -653,6 +1091,13 @@ int NetPrivate::do_forward_layer(const Layer* layer, std::vector<Mat>& blob_mats
             // store top blob
             blob_mats[top_blob_index] = top_blob;
         }
+#if NCNN_BENCHMARK
+        if (profile_enabled)
+        {
+            double f1 = get_current_time();
+            bench_profile_set_forward(f1 - f0);
+        }
+#endif
 
         if (opt.lightmode)
         {
@@ -662,6 +1107,9 @@ int NetPrivate::do_forward_layer(const Layer* layer, std::vector<Mat>& blob_mats
     }
     else
     {
+#if NCNN_BENCHMARK
+        const int profile_enabled = bench_profile_convert_enabled();
+#endif
         std::vector<Mat> bottom_blobs(layer->bottoms.size());
         for (size_t i = 0; i < layer->bottoms.size(); i++)
         {
@@ -685,12 +1133,39 @@ int NetPrivate::do_forward_layer(const Layer* layer, std::vector<Mat>& blob_mats
                 bottom_blobs[i] = bottom_blob_ref;
             }
 
+#if NCNN_BENCHMARK
+            if (profile_enabled)
+            {
+                double t0 = get_current_time();
+                bench_trace_set_blob_id(bottom_blob_index);
+                int ret = convert_layout(bottom_blobs[i], layer, opt);
+                double t1 = get_current_time();
+                bench_profile_add_convert(t1 - t0);
+                bench_trace_set_blob_id(-1);
+                if (ret != 0)
+                    return ret;
+            }
+            else
+            {
+                bench_trace_set_blob_id(bottom_blob_index);
+                int ret = convert_layout(bottom_blobs[i], layer, opt);
+                bench_trace_set_blob_id(-1);
+                if (ret != 0)
+                    return ret;
+            }
+#else
             int ret = convert_layout(bottom_blobs[i], layer, opt);
             if (ret != 0)
                 return ret;
+#endif
         }
 
         // forward
+#if NCNN_BENCHMARK
+        double f0 = 0.0;
+        if (profile_enabled)
+            f0 = get_current_time();
+#endif
         if (opt.lightmode && layer->support_inplace)
         {
             std::vector<Mat>& bottom_top_blobs = bottom_blobs;
@@ -721,6 +1196,13 @@ int NetPrivate::do_forward_layer(const Layer* layer, std::vector<Mat>& blob_mats
                 blob_mats[top_blob_index] = top_blobs[i];
             }
         }
+#if NCNN_BENCHMARK
+        if (profile_enabled)
+        {
+            double f1 = get_current_time();
+            bench_profile_set_forward(f1 - f0);
+        }
+#endif
 
         if (opt.lightmode)
         {
