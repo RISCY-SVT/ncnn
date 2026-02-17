@@ -131,7 +131,7 @@ static void print_usage(const char* prog)
     fprintf(stderr, "  --lightmode 0/1\n");
     fprintf(stderr, "  --winograd 0/1\n");
     fprintf(stderr, "  --sgemm 0/1\n");
-    fprintf(stderr, "  --packing 0/1\n");
+    fprintf(stderr, "  --packing 0/1 (default 1)\n");
     fprintf(stderr, "  --fp16-packed 0/1\n");
     fprintf(stderr, "  --fp16-storage 0/1\n");
     fprintf(stderr, "  --fp16-arith 0/1\n");
@@ -589,6 +589,7 @@ static int extract_blob(const Yolo11Context& ctx, const ncnn::Mat& in_pad, const
     if (!name || name[0] == '\0')
         return 0;
 
+    // Extractor inherits net options (including use_packing_layout) configured in init_yolo11().
     ncnn::Extractor ex = ctx.net.create_extractor();
     extractor_set_num_threads(ex, num_threads, 0);
     if (lightmode)
@@ -852,6 +853,7 @@ static int prepare_yolo11_input(const cv::Mat& bgr, const Yolo11Context& ctx, Yo
 
 static int forward_yolo11(const Yolo11Context& ctx, const ncnn::Mat& in_pad, ncnn::Mat& out, int num_threads, int lightmode)
 {
+    // Extractor inherits net options (including use_packing_layout) configured in init_yolo11().
     ncnn::Extractor ex = ctx.net.create_extractor();
     extractor_set_num_threads(ex, num_threads, 0);
     if (lightmode)
