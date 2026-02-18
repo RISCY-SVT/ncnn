@@ -29,6 +29,8 @@ struct riscv_int8_coverage_counters_t
     std::atomic<unsigned long long> conv_int8_pack1_1x1_fast_count{0};
     std::atomic<unsigned long long> conv_int8_pack1_3x3s1_fast_count{0};
     std::atomic<unsigned long long> conv_int8_pack1_3x3s2_fast_count{0};
+    std::atomic<unsigned long long> conv_int8_packout_used_count{0};
+    std::atomic<unsigned long long> conv_int8_packout_forced_pack1_count{0};
     std::atomic<unsigned long long> post_vrvv_used_count{0};
     std::atomic<unsigned long long> post_scalar_used_count{0};
     std::atomic<unsigned long long> conv_int8_fallback_count{0};
@@ -70,13 +72,15 @@ static void riscv_int8_coverage_dump()
         return v.load(std::memory_order_relaxed);
     };
 
-    NCNN_LOGE("riscv_int8_coverage conv_int8_pack1_1x1_fast_count=%llu conv_int8_pack1_3x3s1_fast_count=%llu conv_int8_pack1_3x3s2_fast_count=%llu post_vrvv_used_count=%llu post_scalar_used_count=%llu conv_int8_fallback_count=%llu "
+    NCNN_LOGE("riscv_int8_coverage conv_int8_pack1_1x1_fast_count=%llu conv_int8_pack1_3x3s1_fast_count=%llu conv_int8_pack1_3x3s2_fast_count=%llu conv_int8_packout_used_count=%llu conv_int8_packout_forced_pack1_count=%llu post_vrvv_used_count=%llu post_scalar_used_count=%llu conv_int8_fallback_count=%llu "
               "fallback_reason_dims_ne3=%llu fallback_reason_dilation_ne1=%llu fallback_reason_stride_not_1_or_2=%llu fallback_reason_kernel_not_1_or_3=%llu "
               "fallback_reason_group_or_channel_mismatch=%llu fallback_reason_int8_scale_term_0=%llu fallback_reason_int8_uniform_false=%llu fallback_reason_bottom_elempack_ne1=%llu "
               "fallback_reason_disable_global=%llu fallback_reason_disable_prep=%llu fallback_reason_disable_1x1=%llu fallback_reason_disable_3x3s1=%llu fallback_reason_disable_3x3s2=%llu",
               load(g_riscv_int8_coverage_counters.conv_int8_pack1_1x1_fast_count),
               load(g_riscv_int8_coverage_counters.conv_int8_pack1_3x3s1_fast_count),
               load(g_riscv_int8_coverage_counters.conv_int8_pack1_3x3s2_fast_count),
+              load(g_riscv_int8_coverage_counters.conv_int8_packout_used_count),
+              load(g_riscv_int8_coverage_counters.conv_int8_packout_forced_pack1_count),
               load(g_riscv_int8_coverage_counters.post_vrvv_used_count),
               load(g_riscv_int8_coverage_counters.post_scalar_used_count),
               load(g_riscv_int8_coverage_counters.conv_int8_fallback_count),
@@ -179,6 +183,16 @@ static inline int riscv_int8_conv_post_vrvv_disabled()
     return g_disable;
 }
 
+static inline int riscv_int8_conv_packout_disabled()
+{
+    static const int g_disable = []() -> int
+    {
+        const char* env = getenv("NCNN_RISCV_INT8_CONV_PACKOUT_DISABLE");
+        return (env && env[0] != '\0' && env[0] != '0') ? 1 : 0;
+    }();
+    return g_disable;
+}
+
 static inline int riscv_int8_conv_force_fma()
 {
     static const int g_force = []() -> int
@@ -229,7 +243,7 @@ static inline int* riscv_get_sums_buffer(size_t n)
     return buf.data();
 }
 
-static inline void riscv_int8_store_fp32_from_sums(float* outptr, const int* sums, int count, float scale_in, float bias, int bias_term, int force_fma, int no_fma, int activation_type, const Mat& activation_params, int disable_post_vrvv, int coverage_enabled)
+static inline void riscv_int8_store_fp32_from_sums(float* outptr, const int* sums, int count, float scale_in, float bias, int bias_term, int force_fma, int no_fma, int activation_type, const Mat& activation_params, int out_stride_elems, int disable_post_vrvv, int coverage_enabled)
 {
 #if __riscv_vector
     if (!disable_post_vrvv && activation_type == 0)
@@ -260,7 +274,15 @@ static inline void riscv_int8_store_fp32_from_sums(float* outptr, const int* sum
                     _sum = __riscv_vfadd_vf_f32m4(_sum, bias, vl);
             }
 
-            __riscv_vse32_v_f32m4(outptr + j, _sum, vl);
+            if (out_stride_elems == 1)
+            {
+                __riscv_vse32_v_f32m4(outptr + j, _sum, vl);
+            }
+            else
+            {
+                ptrdiff_t out_stride_bytes = (ptrdiff_t)out_stride_elems * 4;
+                __riscv_vsse32_v_f32m4(outptr + (size_t)j * out_stride_elems, out_stride_bytes, _sum, vl);
+            }
             j += (int)vl;
         }
 
@@ -274,7 +296,7 @@ static inline void riscv_int8_store_fp32_from_sums(float* outptr, const int* sum
     {
         float sumfp32 = riscv_int8_conv_accum_fp32(sums[j], scale_in, bias, bias_term, force_fma, no_fma);
         sumfp32 = activation_ss(sumfp32, activation_type, activation_params);
-        outptr[j] = sumfp32;
+        outptr[(size_t)j * out_stride_elems] = sumfp32;
     }
 
     if (coverage_enabled)
@@ -745,6 +767,7 @@ int Convolution_riscv::forward(const Mat& bottom_blob, Mat& top_blob, const Opti
         const int disable_rvv_int8_conv3x3s2 = riscv_int8_conv3x3s2_disabled();
         const int disable_rvv_int8_prep = riscv_int8_conv_prep_disabled();
         const int disable_rvv_int8_post_vrvv = riscv_int8_conv_post_vrvv_disabled();
+        const int disable_rvv_int8_packout = riscv_int8_conv_packout_disabled();
         const int num_input = weight_data_size / num_output / (kernel_w * kernel_h);
         const int channels_unpacked = bottom_blob_fp32.c * bottom_blob_fp32.elempack;
         const bool fallback_dims3 = bottom_blob_fp32.dims == 3;
@@ -777,11 +800,6 @@ int Convolution_riscv::forward(const Mat& bottom_blob, Mat& top_blob, const Opti
             int outh = (h - kernel_extent_h) / stride_h + 1;
 
             bool use_int8_requantize = int8_scale_term > 100;
-            size_t out_elemsize = use_int8_requantize ? 1u : 4u;
-
-            top_blob.create(outw, outh, num_output, out_elemsize, opt.blob_allocator);
-            if (top_blob.empty())
-                return -100;
 
 #if NCNN_RISCV_INT8_CONV_DEBUG
             static int g_rvv_int8_conv1x1_seen = 0;
@@ -806,6 +824,22 @@ int Convolution_riscv::forward(const Mat& bottom_blob, Mat& top_blob, const Opti
 #endif
 
             const int vlenb = csrr_vlenb();
+            const int packn_fp32 = std::max(1, vlenb / 4);
+            const bool packout_candidate = opt.use_packing_layout && !use_int8_requantize && num_output % packn_fp32 == 0;
+            const int out_elempack = (packout_candidate && !disable_rvv_int8_packout) ? packn_fp32 : 1;
+            size_t out_elemsize = (use_int8_requantize ? (size_t)1u : (size_t)4u) * out_elempack;
+
+            top_blob.create(outw, outh, num_output / out_elempack, out_elemsize, out_elempack, opt.blob_allocator);
+            if (top_blob.empty())
+                return -100;
+
+            if (coverage_enabled)
+            {
+                if (out_elempack > 1)
+                    g_riscv_int8_coverage_counters.conv_int8_packout_used_count.fetch_add(1, std::memory_order_relaxed);
+                else if (packout_candidate)
+                    g_riscv_int8_coverage_counters.conv_int8_packout_forced_pack1_count.fetch_add(1, std::memory_order_relaxed);
+            }
 
             #pragma omp parallel num_threads(opt.num_threads)
             {
@@ -814,7 +848,9 @@ int Convolution_riscv::forward(const Mat& bottom_blob, Mat& top_blob, const Opti
                 #pragma omp for
                 for (int p = 0; p < num_output; p++)
                 {
-                    Mat outc = top_blob.channel(p);
+                    const int out_channel_index = p / out_elempack;
+                    const int out_lane = p % out_elempack;
+                    Mat outc = top_blob.channel(out_channel_index);
                     const signed char* kptr = (const signed char*)weight_data + channels * p;
 
                     float scale_in = 0.f;
@@ -830,7 +866,7 @@ int Convolution_riscv::forward(const Mat& bottom_blob, Mat& top_blob, const Opti
                     {
                         if (use_int8_requantize)
                         {
-                            signed char* outptr = outc.row<signed char>(i);
+                            signed char* outptr = outc.row<signed char>(i) + out_lane;
 
                             for (int j = 0; j < outw; )
                             {
@@ -851,7 +887,7 @@ int Convolution_riscv::forward(const Mat& bottom_blob, Mat& top_blob, const Opti
                                 {
                                     float sumfp32 = riscv_int8_conv_accum_fp32(sums[jj], scale_in, bias, bias_term, force_fma, no_fma);
                                     sumfp32 = activation_ss(sumfp32, activation_type, activation_params);
-                                    outptr[j + jj] = float2int8_rvv(sumfp32 * scale_out);
+                                    outptr[(j + jj) * out_elempack] = float2int8_rvv(sumfp32 * scale_out);
                                 }
 
                                 j += vl;
@@ -859,7 +895,7 @@ int Convolution_riscv::forward(const Mat& bottom_blob, Mat& top_blob, const Opti
                         }
                         else
                         {
-                            float* outptr = outc.row<float>(i);
+                            float* outptr = outc.row<float>(i) + out_lane;
 
                             for (int j = 0; j < outw; )
                             {
@@ -903,7 +939,7 @@ int Convolution_riscv::forward(const Mat& bottom_blob, Mat& top_blob, const Opti
                                     g_rvv_int8_conv1x1_tail_check = 1;
                                 }
 #endif
-                                riscv_int8_store_fp32_from_sums(outptr + j, sums, (int)vl, scale_in, bias, bias_term, force_fma, no_fma, activation_type, activation_params, disable_rvv_int8_post_vrvv, coverage_enabled);
+                                riscv_int8_store_fp32_from_sums(outptr + (size_t)j * out_elempack, sums, (int)vl, scale_in, bias, bias_term, force_fma, no_fma, activation_type, activation_params, out_elempack, disable_rvv_int8_post_vrvv, coverage_enabled);
 
                                 j += vl;
                             }
@@ -1001,11 +1037,6 @@ int Convolution_riscv::forward(const Mat& bottom_blob, Mat& top_blob, const Opti
             int outh = (h - kernel_extent_h) / stride_h + 1;
 
             bool use_int8_requantize = int8_scale_term > 100;
-            size_t out_elemsize = use_int8_requantize ? 1u : 4u;
-
-            top_blob.create(outw, outh, num_output, out_elemsize, opt.blob_allocator);
-            if (top_blob.empty())
-                return -100;
 
 #if NCNN_RISCV_INT8_CONV_DEBUG
             static int g_rvv_int8_conv3x3s1_seen = 0;
@@ -1030,6 +1061,22 @@ int Convolution_riscv::forward(const Mat& bottom_blob, Mat& top_blob, const Opti
 #endif
 
             const int vlenb = csrr_vlenb();
+            const int packn_fp32 = std::max(1, vlenb / 4);
+            const bool packout_candidate = opt.use_packing_layout && !use_int8_requantize && num_output % packn_fp32 == 0;
+            const int out_elempack = (packout_candidate && !disable_rvv_int8_packout) ? packn_fp32 : 1;
+            size_t out_elemsize = (use_int8_requantize ? (size_t)1u : (size_t)4u) * out_elempack;
+
+            top_blob.create(outw, outh, num_output / out_elempack, out_elemsize, out_elempack, opt.blob_allocator);
+            if (top_blob.empty())
+                return -100;
+
+            if (coverage_enabled)
+            {
+                if (out_elempack > 1)
+                    g_riscv_int8_coverage_counters.conv_int8_packout_used_count.fetch_add(1, std::memory_order_relaxed);
+                else if (packout_candidate)
+                    g_riscv_int8_coverage_counters.conv_int8_packout_forced_pack1_count.fetch_add(1, std::memory_order_relaxed);
+            }
 
             #pragma omp parallel num_threads(opt.num_threads)
             {
@@ -1038,7 +1085,9 @@ int Convolution_riscv::forward(const Mat& bottom_blob, Mat& top_blob, const Opti
                 #pragma omp for
                 for (int p = 0; p < num_output; p++)
                 {
-                    Mat outc = top_blob.channel(p);
+                    const int out_channel_index = p / out_elempack;
+                    const int out_lane = p % out_elempack;
+                    Mat outc = top_blob.channel(out_channel_index);
                     const signed char* kptr = (const signed char*)weight_data + channels * p * 9;
 
                     float scale_in = 0.f;
@@ -1056,7 +1105,7 @@ int Convolution_riscv::forward(const Mat& bottom_blob, Mat& top_blob, const Opti
 
                         if (use_int8_requantize)
                         {
-                            signed char* outptr = outc.row<signed char>(i);
+                            signed char* outptr = outc.row<signed char>(i) + out_lane;
 
                             for (int j = 0; j < outw; )
                             {
@@ -1108,7 +1157,7 @@ int Convolution_riscv::forward(const Mat& bottom_blob, Mat& top_blob, const Opti
                                 {
                                     float sumfp32 = riscv_int8_conv_accum_fp32(sums[jj], scale_in, bias, bias_term, force_fma, no_fma);
                                     sumfp32 = activation_ss(sumfp32, activation_type, activation_params);
-                                    outptr[j + jj] = float2int8_rvv(sumfp32 * scale_out);
+                                    outptr[(j + jj) * out_elempack] = float2int8_rvv(sumfp32 * scale_out);
                                 }
 
                                 j += vl;
@@ -1116,7 +1165,7 @@ int Convolution_riscv::forward(const Mat& bottom_blob, Mat& top_blob, const Opti
                         }
                         else
                         {
-                            float* outptr = outc.row<float>(i);
+                            float* outptr = outc.row<float>(i) + out_lane;
 
                             for (int j = 0; j < outw; )
                             {
@@ -1213,7 +1262,7 @@ int Convolution_riscv::forward(const Mat& bottom_blob, Mat& top_blob, const Opti
                                     g_rvv_int8_conv3x3s1_tail_check = 1;
                                 }
 #endif
-                                riscv_int8_store_fp32_from_sums(outptr + j, sums, (int)vl, scale_in, bias, bias_term, force_fma, no_fma, activation_type, activation_params, disable_rvv_int8_post_vrvv, coverage_enabled);
+                                riscv_int8_store_fp32_from_sums(outptr + (size_t)j * out_elempack, sums, (int)vl, scale_in, bias, bias_term, force_fma, no_fma, activation_type, activation_params, out_elempack, disable_rvv_int8_post_vrvv, coverage_enabled);
 
                                 j += vl;
                             }
@@ -1316,11 +1365,6 @@ int Convolution_riscv::forward(const Mat& bottom_blob, Mat& top_blob, const Opti
             int outh = (h - kernel_extent_h) / stride_h + 1;
 
             bool use_int8_requantize = int8_scale_term > 100;
-            size_t out_elemsize = use_int8_requantize ? 1u : 4u;
-
-            top_blob.create(outw, outh, num_output, out_elemsize, opt.blob_allocator);
-            if (top_blob.empty())
-                return -100;
 
 #if NCNN_RISCV_INT8_CONV_DEBUG
             static int g_rvv_int8_conv3x3s2_seen = 0;
@@ -1345,6 +1389,22 @@ int Convolution_riscv::forward(const Mat& bottom_blob, Mat& top_blob, const Opti
 #endif
 
             const int vlenb = csrr_vlenb();
+            const int packn_fp32 = std::max(1, vlenb / 4);
+            const bool packout_candidate = opt.use_packing_layout && !use_int8_requantize && num_output % packn_fp32 == 0;
+            const int out_elempack = (packout_candidate && !disable_rvv_int8_packout) ? packn_fp32 : 1;
+            size_t out_elemsize = (use_int8_requantize ? (size_t)1u : (size_t)4u) * out_elempack;
+
+            top_blob.create(outw, outh, num_output / out_elempack, out_elemsize, out_elempack, opt.blob_allocator);
+            if (top_blob.empty())
+                return -100;
+
+            if (coverage_enabled)
+            {
+                if (out_elempack > 1)
+                    g_riscv_int8_coverage_counters.conv_int8_packout_used_count.fetch_add(1, std::memory_order_relaxed);
+                else if (packout_candidate)
+                    g_riscv_int8_coverage_counters.conv_int8_packout_forced_pack1_count.fetch_add(1, std::memory_order_relaxed);
+            }
 
             #pragma omp parallel num_threads(opt.num_threads)
             {
@@ -1353,7 +1413,9 @@ int Convolution_riscv::forward(const Mat& bottom_blob, Mat& top_blob, const Opti
                 #pragma omp for
                 for (int p = 0; p < num_output; p++)
                 {
-                    Mat outc = top_blob.channel(p);
+                    const int out_channel_index = p / out_elempack;
+                    const int out_lane = p % out_elempack;
+                    Mat outc = top_blob.channel(out_channel_index);
                     const signed char* kptr = (const signed char*)weight_data + channels * p * 9;
 
                     float scale_in = 0.f;
@@ -1371,7 +1433,7 @@ int Convolution_riscv::forward(const Mat& bottom_blob, Mat& top_blob, const Opti
 
                         if (use_int8_requantize)
                         {
-                            signed char* outptr = outc.row<signed char>(i);
+                            signed char* outptr = outc.row<signed char>(i) + out_lane;
 
                             for (int j = 0; j < outw; )
                             {
@@ -1423,7 +1485,7 @@ int Convolution_riscv::forward(const Mat& bottom_blob, Mat& top_blob, const Opti
                                 {
                                     float sumfp32 = riscv_int8_conv_accum_fp32(sums[jj], scale_in, bias, bias_term, force_fma, no_fma);
                                     sumfp32 = activation_ss(sumfp32, activation_type, activation_params);
-                                    outptr[j + jj] = float2int8_rvv(sumfp32 * scale_out);
+                                    outptr[(j + jj) * out_elempack] = float2int8_rvv(sumfp32 * scale_out);
                                 }
 
                                 j += vl;
@@ -1431,7 +1493,7 @@ int Convolution_riscv::forward(const Mat& bottom_blob, Mat& top_blob, const Opti
                         }
                         else
                         {
-                            float* outptr = outc.row<float>(i);
+                            float* outptr = outc.row<float>(i) + out_lane;
 
                             for (int j = 0; j < outw; )
                             {
@@ -1528,7 +1590,7 @@ int Convolution_riscv::forward(const Mat& bottom_blob, Mat& top_blob, const Opti
                                     g_rvv_int8_conv3x3s2_tail_check = 1;
                                 }
 #endif
-                                riscv_int8_store_fp32_from_sums(outptr + j, sums, (int)vl, scale_in, bias, bias_term, force_fma, no_fma, activation_type, activation_params, disable_rvv_int8_post_vrvv, coverage_enabled);
+                                riscv_int8_store_fp32_from_sums(outptr + (size_t)j * out_elempack, sums, (int)vl, scale_in, bias, bias_term, force_fma, no_fma, activation_type, activation_params, out_elempack, disable_rvv_int8_post_vrvv, coverage_enabled);
 
                                 j += vl;
                             }
