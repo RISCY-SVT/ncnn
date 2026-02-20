@@ -135,6 +135,7 @@ static void print_usage(const char* prog)
     fprintf(stderr, "  --fp16-packed 0/1\n");
     fprintf(stderr, "  --fp16-storage 0/1\n");
     fprintf(stderr, "  --fp16-arith 0/1\n");
+    fprintf(stderr, "  NOTE: K1X INT8 pack1 canonical run uses --packing 1 --fp16-packed 0 (keep --fp16-storage 1 --fp16-arith 1)\n");
 }
 
 static int parse_int_arg(const char* s, int& out)
@@ -1542,6 +1543,11 @@ int main(int argc, char** argv)
     fprintf(stderr, "  int8_uniform: %d\n", int8_opt.use_int8_uniform);
     fprintf(stderr, "  model_int8_hint: %d\n", model_int8_hint);
     fprintf(stderr, "\n");
+
+    if (int8_opt.use_int8_inference && opt.packing == 1 && opt.fp16_packed == 1)
+    {
+        fprintf(stderr, "WARNING: For K1X INT8 pack1 canonical runs use --packing 1 --fp16-packed 0 (keep --fp16-storage 1 --fp16-arith 1).\n");
+    }
 
     if (!opt.desired_omp_wait_policy.empty() || opt.desired_gomp_spincount >= 0)
     {

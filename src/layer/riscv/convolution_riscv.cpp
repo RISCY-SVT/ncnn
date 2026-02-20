@@ -31,6 +31,7 @@ struct riscv_int8_coverage_counters_t
     std::atomic<unsigned long long> conv_int8_pack1_3x3s2_fast_count{0};
     std::atomic<unsigned long long> conv_int8_packout_used_count{0};
     std::atomic<unsigned long long> conv_int8_packout_forced_pack1_count{0};
+    std::atomic<unsigned long long> conv_int8_packout_blocked_activation_count{0};
     std::atomic<unsigned long long> conv_int8_packout_q_omp_used_count{0};
     std::atomic<unsigned long long> conv_int8_packout_q_omp_forced_oldmap_count{0};
     std::atomic<unsigned long long> packout_store_vsse32_count{0};
@@ -78,7 +79,7 @@ static void riscv_int8_coverage_dump()
         return v.load(std::memory_order_relaxed);
     };
 
-    NCNN_LOGE("riscv_int8_coverage conv_int8_pack1_1x1_fast_count=%llu conv_int8_pack1_3x3s1_fast_count=%llu conv_int8_pack1_3x3s2_fast_count=%llu conv_int8_packout_used_count=%llu conv_int8_packout_forced_pack1_count=%llu conv_int8_packout_q_omp_used_count=%llu conv_int8_packout_q_omp_forced_oldmap_count=%llu packout_store_vsse32_count=%llu packout_store_vsseg_count=%llu s2_load_vlse8_count=%llu s2_load_vlseg2_count=%llu post_vrvv_used_count=%llu post_scalar_used_count=%llu conv_int8_fallback_count=%llu "
+    NCNN_LOGE("riscv_int8_coverage conv_int8_pack1_1x1_fast_count=%llu conv_int8_pack1_3x3s1_fast_count=%llu conv_int8_pack1_3x3s2_fast_count=%llu conv_int8_packout_used_count=%llu conv_int8_packout_forced_pack1_count=%llu conv_int8_packout_blocked_activation_count=%llu conv_int8_packout_q_omp_used_count=%llu conv_int8_packout_q_omp_forced_oldmap_count=%llu packout_store_vsse32_count=%llu packout_store_vsseg_count=%llu s2_load_vlse8_count=%llu s2_load_vlseg2_count=%llu post_vrvv_used_count=%llu post_scalar_used_count=%llu conv_int8_fallback_count=%llu "
               "fallback_reason_dims_ne3=%llu fallback_reason_dilation_ne1=%llu fallback_reason_stride_not_1_or_2=%llu fallback_reason_kernel_not_1_or_3=%llu "
               "fallback_reason_group_or_channel_mismatch=%llu fallback_reason_int8_scale_term_0=%llu fallback_reason_int8_uniform_false=%llu fallback_reason_bottom_elempack_ne1=%llu "
               "fallback_reason_disable_global=%llu fallback_reason_disable_prep=%llu fallback_reason_disable_1x1=%llu fallback_reason_disable_3x3s1=%llu fallback_reason_disable_3x3s2=%llu",
@@ -87,6 +88,7 @@ static void riscv_int8_coverage_dump()
               load(g_riscv_int8_coverage_counters.conv_int8_pack1_3x3s2_fast_count),
               load(g_riscv_int8_coverage_counters.conv_int8_packout_used_count),
               load(g_riscv_int8_coverage_counters.conv_int8_packout_forced_pack1_count),
+              load(g_riscv_int8_coverage_counters.conv_int8_packout_blocked_activation_count),
               load(g_riscv_int8_coverage_counters.conv_int8_packout_q_omp_used_count),
               load(g_riscv_int8_coverage_counters.conv_int8_packout_q_omp_forced_oldmap_count),
               load(g_riscv_int8_coverage_counters.packout_store_vsse32_count),
@@ -296,19 +298,19 @@ static inline int* riscv_get_sums_buffer_slot(size_t n, int slot)
     return buf.data();
 }
 
-static inline vint8m1_t riscv_int8_load_stride2_i8m1(const signed char* ptr, size_t vl, int disable_s2_vlseg2, int coverage_enabled)
+static inline vint8m1_t riscv_int8_load_stride2_i8m1(const signed char* ptr, size_t vl, int use_s2_vlseg2, int coverage_enabled)
 {
 #if __riscv_vector
-    if (!disable_s2_vlseg2)
+    if (use_s2_vlseg2)
     {
         vuint8m1x2_t _p = __riscv_vlseg2e8_v_u8m1x2((const unsigned char*)ptr, vl);
         if (coverage_enabled)
-            g_riscv_int8_coverage_counters.s2_load_vlseg2_count.fetch_add(1, std::memory_order_relaxed);
+            g_riscv_int8_coverage_counters.s2_load_vlseg2_count.fetch_add((unsigned long long)vl, std::memory_order_relaxed);
         return __riscv_vreinterpret_v_u8m1_i8m1(__riscv_vget_v_u8m1x2_u8m1(_p, 0));
     }
 #endif
     if (coverage_enabled)
-        g_riscv_int8_coverage_counters.s2_load_vlse8_count.fetch_add(1, std::memory_order_relaxed);
+        g_riscv_int8_coverage_counters.s2_load_vlse8_count.fetch_add((unsigned long long)vl, std::memory_order_relaxed);
     return __riscv_vlse8_v_i8m1(ptr, 2, vl);
 }
 
@@ -977,7 +979,13 @@ int Convolution_riscv::forward(const Mat& bottom_blob, Mat& top_blob, const Opti
 
             const int vlenb = csrr_vlenb();
             const int packn_fp32 = std::max(1, vlenb / 4);
-            const bool packout_candidate = opt.use_packing_layout && !use_int8_requantize && num_output % packn_fp32 == 0;
+            bool packout_candidate = opt.use_packing_layout && !use_int8_requantize && num_output % packn_fp32 == 0;
+            if (packout_candidate && activation_type != 0)
+            {
+                packout_candidate = false;
+                if (coverage_enabled)
+                    g_riscv_int8_coverage_counters.conv_int8_packout_blocked_activation_count.fetch_add(1, std::memory_order_relaxed);
+            }
             const int out_elempack = (packout_candidate && !disable_rvv_int8_packout) ? packn_fp32 : 1;
             size_t out_elemsize = (use_int8_requantize ? (size_t)1u : (size_t)4u) * out_elempack;
 
@@ -1281,7 +1289,13 @@ int Convolution_riscv::forward(const Mat& bottom_blob, Mat& top_blob, const Opti
 
             const int vlenb = csrr_vlenb();
             const int packn_fp32 = std::max(1, vlenb / 4);
-            const bool packout_candidate = opt.use_packing_layout && !use_int8_requantize && num_output % packn_fp32 == 0;
+            bool packout_candidate = opt.use_packing_layout && !use_int8_requantize && num_output % packn_fp32 == 0;
+            if (packout_candidate && activation_type != 0)
+            {
+                packout_candidate = false;
+                if (coverage_enabled)
+                    g_riscv_int8_coverage_counters.conv_int8_packout_blocked_activation_count.fetch_add(1, std::memory_order_relaxed);
+            }
             const int out_elempack = (packout_candidate && !disable_rvv_int8_packout) ? packn_fp32 : 1;
             size_t out_elemsize = (use_int8_requantize ? (size_t)1u : (size_t)4u) * out_elempack;
 
@@ -1653,7 +1667,13 @@ int Convolution_riscv::forward(const Mat& bottom_blob, Mat& top_blob, const Opti
 
             const int vlenb = csrr_vlenb();
             const int packn_fp32 = std::max(1, vlenb / 4);
-            const bool packout_candidate = opt.use_packing_layout && !use_int8_requantize && num_output % packn_fp32 == 0;
+            bool packout_candidate = opt.use_packing_layout && !use_int8_requantize && num_output % packn_fp32 == 0;
+            if (packout_candidate && activation_type != 0)
+            {
+                packout_candidate = false;
+                if (coverage_enabled)
+                    g_riscv_int8_coverage_counters.conv_int8_packout_blocked_activation_count.fetch_add(1, std::memory_order_relaxed);
+            }
             const int out_elempack = (packout_candidate && !disable_rvv_int8_packout) ? packn_fp32 : 1;
             size_t out_elemsize = (use_int8_requantize ? (size_t)1u : (size_t)4u) * out_elempack;
 
@@ -1700,7 +1720,18 @@ int Convolution_riscv::forward(const Mat& bottom_blob, Mat& top_blob, const Opti
 
                             for (int j = 0; j < outw; )
                             {
-                                size_t vl = __riscv_vsetvl_e8m1(outw - j);
+                                const int remain = outw - j;
+                                const int in_x = j * 2;
+                                int max_pairs = 0;
+                                if (!disable_rvv_int8_s2_vlseg2 && in_x + 2 < w)
+                                    max_pairs = (w - (in_x + 2)) / 2;
+                                int use_s2_vlseg2 = max_pairs > 0;
+                                size_t vl = use_s2_vlseg2 ? __riscv_vsetvl_e8m1((size_t)std::min(remain, max_pairs)) : __riscv_vsetvl_e8m1((size_t)remain);
+                                if (vl == 0)
+                                {
+                                    use_s2_vlseg2 = 0;
+                                    vl = __riscv_vsetvl_e8m1((size_t)remain);
+                                }
                                 vint32m4_t _sum = __riscv_vmv_v_x_i32m4(0, vl);
 
                                 for (int q = 0; q < channels; q++)
@@ -1711,15 +1742,15 @@ int Convolution_riscv::forward(const Mat& bottom_blob, Mat& top_blob, const Opti
                                     const signed char* r1 = bottom_blob_bordered.channel(q).row<signed char>(in_y + 1) + j * 2;
                                     const signed char* r2 = bottom_blob_bordered.channel(q).row<signed char>(in_y + 2) + j * 2;
 
-                                    vint8m1_t _r00 = riscv_int8_load_stride2_i8m1(r0 + 0, vl, disable_rvv_int8_s2_vlseg2, coverage_enabled);
-                                    vint8m1_t _r01 = riscv_int8_load_stride2_i8m1(r0 + 1, vl, disable_rvv_int8_s2_vlseg2, coverage_enabled);
-                                    vint8m1_t _r02 = riscv_int8_load_stride2_i8m1(r0 + 2, vl, disable_rvv_int8_s2_vlseg2, coverage_enabled);
-                                    vint8m1_t _r10 = riscv_int8_load_stride2_i8m1(r1 + 0, vl, disable_rvv_int8_s2_vlseg2, coverage_enabled);
-                                    vint8m1_t _r11 = riscv_int8_load_stride2_i8m1(r1 + 1, vl, disable_rvv_int8_s2_vlseg2, coverage_enabled);
-                                    vint8m1_t _r12 = riscv_int8_load_stride2_i8m1(r1 + 2, vl, disable_rvv_int8_s2_vlseg2, coverage_enabled);
-                                    vint8m1_t _r20 = riscv_int8_load_stride2_i8m1(r2 + 0, vl, disable_rvv_int8_s2_vlseg2, coverage_enabled);
-                                    vint8m1_t _r21 = riscv_int8_load_stride2_i8m1(r2 + 1, vl, disable_rvv_int8_s2_vlseg2, coverage_enabled);
-                                    vint8m1_t _r22 = riscv_int8_load_stride2_i8m1(r2 + 2, vl, disable_rvv_int8_s2_vlseg2, coverage_enabled);
+                                    vint8m1_t _r00 = riscv_int8_load_stride2_i8m1(r0 + 0, vl, use_s2_vlseg2, coverage_enabled);
+                                    vint8m1_t _r01 = riscv_int8_load_stride2_i8m1(r0 + 1, vl, use_s2_vlseg2, coverage_enabled);
+                                    vint8m1_t _r02 = riscv_int8_load_stride2_i8m1(r0 + 2, vl, use_s2_vlseg2, coverage_enabled);
+                                    vint8m1_t _r10 = riscv_int8_load_stride2_i8m1(r1 + 0, vl, use_s2_vlseg2, coverage_enabled);
+                                    vint8m1_t _r11 = riscv_int8_load_stride2_i8m1(r1 + 1, vl, use_s2_vlseg2, coverage_enabled);
+                                    vint8m1_t _r12 = riscv_int8_load_stride2_i8m1(r1 + 2, vl, use_s2_vlseg2, coverage_enabled);
+                                    vint8m1_t _r20 = riscv_int8_load_stride2_i8m1(r2 + 0, vl, use_s2_vlseg2, coverage_enabled);
+                                    vint8m1_t _r21 = riscv_int8_load_stride2_i8m1(r2 + 1, vl, use_s2_vlseg2, coverage_enabled);
+                                    vint8m1_t _r22 = riscv_int8_load_stride2_i8m1(r2 + 2, vl, use_s2_vlseg2, coverage_enabled);
 
                                     vint16m2_t _r00_16 = __riscv_vsext_vf2_i16m2(_r00, vl);
                                     vint16m2_t _r01_16 = __riscv_vsext_vf2_i16m2(_r01, vl);
@@ -1760,7 +1791,18 @@ int Convolution_riscv::forward(const Mat& bottom_blob, Mat& top_blob, const Opti
 
                             for (int j = 0; j < outw; )
                             {
-                                size_t vl = __riscv_vsetvl_e8m1(outw - j);
+                                const int remain = outw - j;
+                                const int in_x = j * 2;
+                                int max_pairs = 0;
+                                if (!disable_rvv_int8_s2_vlseg2 && in_x + 2 < w)
+                                    max_pairs = (w - (in_x + 2)) / 2;
+                                int use_s2_vlseg2 = max_pairs > 0;
+                                size_t vl = use_s2_vlseg2 ? __riscv_vsetvl_e8m1((size_t)std::min(remain, max_pairs)) : __riscv_vsetvl_e8m1((size_t)remain);
+                                if (vl == 0)
+                                {
+                                    use_s2_vlseg2 = 0;
+                                    vl = __riscv_vsetvl_e8m1((size_t)remain);
+                                }
                                 vint32m4_t _sum = __riscv_vmv_v_x_i32m4(0, vl);
 
                                 for (int q = 0; q < channels; q++)
@@ -1771,15 +1813,15 @@ int Convolution_riscv::forward(const Mat& bottom_blob, Mat& top_blob, const Opti
                                     const signed char* r1 = bottom_blob_bordered.channel(q).row<signed char>(in_y + 1) + j * 2;
                                     const signed char* r2 = bottom_blob_bordered.channel(q).row<signed char>(in_y + 2) + j * 2;
 
-                                    vint8m1_t _r00 = riscv_int8_load_stride2_i8m1(r0 + 0, vl, disable_rvv_int8_s2_vlseg2, coverage_enabled);
-                                    vint8m1_t _r01 = riscv_int8_load_stride2_i8m1(r0 + 1, vl, disable_rvv_int8_s2_vlseg2, coverage_enabled);
-                                    vint8m1_t _r02 = riscv_int8_load_stride2_i8m1(r0 + 2, vl, disable_rvv_int8_s2_vlseg2, coverage_enabled);
-                                    vint8m1_t _r10 = riscv_int8_load_stride2_i8m1(r1 + 0, vl, disable_rvv_int8_s2_vlseg2, coverage_enabled);
-                                    vint8m1_t _r11 = riscv_int8_load_stride2_i8m1(r1 + 1, vl, disable_rvv_int8_s2_vlseg2, coverage_enabled);
-                                    vint8m1_t _r12 = riscv_int8_load_stride2_i8m1(r1 + 2, vl, disable_rvv_int8_s2_vlseg2, coverage_enabled);
-                                    vint8m1_t _r20 = riscv_int8_load_stride2_i8m1(r2 + 0, vl, disable_rvv_int8_s2_vlseg2, coverage_enabled);
-                                    vint8m1_t _r21 = riscv_int8_load_stride2_i8m1(r2 + 1, vl, disable_rvv_int8_s2_vlseg2, coverage_enabled);
-                                    vint8m1_t _r22 = riscv_int8_load_stride2_i8m1(r2 + 2, vl, disable_rvv_int8_s2_vlseg2, coverage_enabled);
+                                    vint8m1_t _r00 = riscv_int8_load_stride2_i8m1(r0 + 0, vl, use_s2_vlseg2, coverage_enabled);
+                                    vint8m1_t _r01 = riscv_int8_load_stride2_i8m1(r0 + 1, vl, use_s2_vlseg2, coverage_enabled);
+                                    vint8m1_t _r02 = riscv_int8_load_stride2_i8m1(r0 + 2, vl, use_s2_vlseg2, coverage_enabled);
+                                    vint8m1_t _r10 = riscv_int8_load_stride2_i8m1(r1 + 0, vl, use_s2_vlseg2, coverage_enabled);
+                                    vint8m1_t _r11 = riscv_int8_load_stride2_i8m1(r1 + 1, vl, use_s2_vlseg2, coverage_enabled);
+                                    vint8m1_t _r12 = riscv_int8_load_stride2_i8m1(r1 + 2, vl, use_s2_vlseg2, coverage_enabled);
+                                    vint8m1_t _r20 = riscv_int8_load_stride2_i8m1(r2 + 0, vl, use_s2_vlseg2, coverage_enabled);
+                                    vint8m1_t _r21 = riscv_int8_load_stride2_i8m1(r2 + 1, vl, use_s2_vlseg2, coverage_enabled);
+                                    vint8m1_t _r22 = riscv_int8_load_stride2_i8m1(r2 + 2, vl, use_s2_vlseg2, coverage_enabled);
 
                                     vint16m2_t _r00_16 = __riscv_vsext_vf2_i16m2(_r00, vl);
                                     vint16m2_t _r01_16 = __riscv_vsext_vf2_i16m2(_r01, vl);
