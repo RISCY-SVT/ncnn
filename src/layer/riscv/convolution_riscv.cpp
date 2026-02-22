@@ -8,7 +8,9 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <map>
 #include <mutex>
+#include <tuple>
 #include <vector>
 
 #include "benchmark.h"
@@ -117,6 +119,104 @@ static inline void riscv_int8_coverage_register_atexit_once()
 {
     static std::once_flag g_coverage_once;
     std::call_once(g_coverage_once, []() { atexit(riscv_int8_coverage_dump); });
+}
+
+struct riscv_int8_packing_audit_key_t
+{
+    int kernel_w;
+    int kernel_h;
+    int stride_w;
+    int stride_h;
+    int dilation_w;
+    int dilation_h;
+    int in_elempack;
+    int bottom_scalar_elemsize;
+    int requested_out_elempack;
+    int activation_type;
+
+    bool operator<(const riscv_int8_packing_audit_key_t& b) const
+    {
+        return std::tie(kernel_w, kernel_h, stride_w, stride_h, dilation_w, dilation_h, in_elempack, bottom_scalar_elemsize, requested_out_elempack, activation_type)
+            < std::tie(b.kernel_w, b.kernel_h, b.stride_w, b.stride_h, b.dilation_w, b.dilation_h, b.in_elempack, b.bottom_scalar_elemsize, b.requested_out_elempack, b.activation_type);
+    }
+};
+
+static std::mutex g_riscv_int8_packing_audit_mutex;
+static std::map<riscv_int8_packing_audit_key_t, unsigned long long> g_riscv_int8_packing_audit_hist;
+
+static inline int riscv_int8_packing_audit_enabled()
+{
+    static const int g_enabled = []() -> int
+    {
+        const char* env = getenv("NCNN_RISCV_INT8_PACKING_AUDIT");
+        return (env && env[0] != '\0' && env[0] != '0') ? 1 : 0;
+    }();
+    return g_enabled;
+}
+
+static inline void riscv_int8_packing_audit_record(int kernel_w, int kernel_h, int stride_w, int stride_h, int dilation_w, int dilation_h, int in_elempack, int bottom_scalar_elemsize, int requested_out_elempack, int activation_type)
+{
+    if (!riscv_int8_packing_audit_enabled())
+        return;
+
+    riscv_int8_packing_audit_key_t k;
+    k.kernel_w = kernel_w;
+    k.kernel_h = kernel_h;
+    k.stride_w = stride_w;
+    k.stride_h = stride_h;
+    k.dilation_w = dilation_w;
+    k.dilation_h = dilation_h;
+    k.in_elempack = in_elempack;
+    k.bottom_scalar_elemsize = bottom_scalar_elemsize;
+    k.requested_out_elempack = requested_out_elempack;
+    k.activation_type = activation_type;
+
+    std::lock_guard<std::mutex> lock(g_riscv_int8_packing_audit_mutex);
+    g_riscv_int8_packing_audit_hist[k] += 1;
+}
+
+static void riscv_int8_packing_audit_dump()
+{
+    if (!riscv_int8_packing_audit_enabled())
+        return;
+
+    typedef std::pair<riscv_int8_packing_audit_key_t, unsigned long long> packing_audit_item_t;
+    std::vector<packing_audit_item_t> items;
+    {
+        std::lock_guard<std::mutex> lock(g_riscv_int8_packing_audit_mutex);
+        items.reserve(g_riscv_int8_packing_audit_hist.size());
+        for (std::map<riscv_int8_packing_audit_key_t, unsigned long long>::const_iterator it = g_riscv_int8_packing_audit_hist.begin(); it != g_riscv_int8_packing_audit_hist.end(); ++it)
+        {
+            items.push_back(*it);
+        }
+    }
+
+    std::sort(items.begin(), items.end(), [](const packing_audit_item_t& a, const packing_audit_item_t& b)
+    {
+        if (a.second != b.second)
+            return a.second > b.second;
+        return a.first < b.first;
+    });
+
+    NCNN_LOGE("riscv_int8_packing_audit bins=%d", (int)items.size());
+    for (size_t i = 0; i < items.size(); i++)
+    {
+        const riscv_int8_packing_audit_key_t& k = items[i].first;
+        const unsigned long long count = items[i].second;
+        NCNN_LOGE("riscv_int8_packing_audit count=%llu k=%dx%d s=%dx%d d=%dx%d in_pack=%d in_scalar_elemsize=%d req_out_pack=%d activation_type=%d",
+                  count,
+                  k.kernel_w, k.kernel_h,
+                  k.stride_w, k.stride_h,
+                  k.dilation_w, k.dilation_h,
+                  k.in_elempack, k.bottom_scalar_elemsize,
+                  k.requested_out_elempack, k.activation_type);
+    }
+}
+
+static inline void riscv_int8_packing_audit_register_atexit_once()
+{
+    static std::once_flag g_packing_audit_once;
+    std::call_once(g_packing_audit_once, []() { atexit(riscv_int8_packing_audit_dump); });
 }
 
 static inline signed char float2int8_rvv(float v)
@@ -707,6 +807,9 @@ int Convolution_riscv::forward(const Mat& bottom_blob, Mat& top_blob, const Opti
     const bool coverage_enabled = riscv_int8_coverage_enabled() != 0;
     if (coverage_enabled)
         riscv_int8_coverage_register_atexit_once();
+    const bool packing_audit_enabled = riscv_int8_packing_audit_enabled() != 0;
+    if (packing_audit_enabled)
+        riscv_int8_packing_audit_register_atexit_once();
 
     if (coverage_enabled && opt.use_int8_inference && !int8_scale_term)
     {
@@ -979,7 +1082,15 @@ int Convolution_riscv::forward(const Mat& bottom_blob, Mat& top_blob, const Opti
 
             const int vlenb = csrr_vlenb();
             const int packn_fp32 = std::max(1, vlenb / 4);
-            bool packout_candidate = opt.use_packing_layout && !use_int8_requantize && num_output % packn_fp32 == 0;
+            const bool packout_layout_candidate = opt.use_packing_layout && !use_int8_requantize && num_output % packn_fp32 == 0;
+            const int requested_out_elempack = packout_layout_candidate ? packn_fp32 : 1;
+            if (packing_audit_enabled)
+            {
+                const int bottom_scalar_elemsize = bottom_blob_bordered.elempack > 0 ? (int)(bottom_blob_bordered.elemsize / (size_t)bottom_blob_bordered.elempack) : 0;
+                riscv_int8_packing_audit_record(kernel_w, kernel_h, stride_w, stride_h, dilation_w, dilation_h,
+                                                bottom_blob_bordered.elempack, bottom_scalar_elemsize, requested_out_elempack, activation_type);
+            }
+            bool packout_candidate = packout_layout_candidate;
             if (packout_candidate && activation_type != 0)
             {
                 packout_candidate = false;
@@ -1289,7 +1400,15 @@ int Convolution_riscv::forward(const Mat& bottom_blob, Mat& top_blob, const Opti
 
             const int vlenb = csrr_vlenb();
             const int packn_fp32 = std::max(1, vlenb / 4);
-            bool packout_candidate = opt.use_packing_layout && !use_int8_requantize && num_output % packn_fp32 == 0;
+            const bool packout_layout_candidate = opt.use_packing_layout && !use_int8_requantize && num_output % packn_fp32 == 0;
+            const int requested_out_elempack = packout_layout_candidate ? packn_fp32 : 1;
+            if (packing_audit_enabled)
+            {
+                const int bottom_scalar_elemsize = bottom_blob_bordered.elempack > 0 ? (int)(bottom_blob_bordered.elemsize / (size_t)bottom_blob_bordered.elempack) : 0;
+                riscv_int8_packing_audit_record(kernel_w, kernel_h, stride_w, stride_h, dilation_w, dilation_h,
+                                                bottom_blob_bordered.elempack, bottom_scalar_elemsize, requested_out_elempack, activation_type);
+            }
+            bool packout_candidate = packout_layout_candidate;
             if (packout_candidate && activation_type != 0)
             {
                 packout_candidate = false;
@@ -1667,7 +1786,15 @@ int Convolution_riscv::forward(const Mat& bottom_blob, Mat& top_blob, const Opti
 
             const int vlenb = csrr_vlenb();
             const int packn_fp32 = std::max(1, vlenb / 4);
-            bool packout_candidate = opt.use_packing_layout && !use_int8_requantize && num_output % packn_fp32 == 0;
+            const bool packout_layout_candidate = opt.use_packing_layout && !use_int8_requantize && num_output % packn_fp32 == 0;
+            const int requested_out_elempack = packout_layout_candidate ? packn_fp32 : 1;
+            if (packing_audit_enabled)
+            {
+                const int bottom_scalar_elemsize = bottom_blob_bordered.elempack > 0 ? (int)(bottom_blob_bordered.elemsize / (size_t)bottom_blob_bordered.elempack) : 0;
+                riscv_int8_packing_audit_record(kernel_w, kernel_h, stride_w, stride_h, dilation_w, dilation_h,
+                                                bottom_blob_bordered.elempack, bottom_scalar_elemsize, requested_out_elempack, activation_type);
+            }
+            bool packout_candidate = packout_layout_candidate;
             if (packout_candidate && activation_type != 0)
             {
                 packout_candidate = false;
@@ -1991,6 +2118,23 @@ int Convolution_riscv::forward(const Mat& bottom_blob, Mat& top_blob, const Opti
 #endif
             if (bottom_blob_unpacked_fp32.empty())
                 return -100;
+        }
+
+        if (packing_audit_enabled)
+        {
+            int requested_out_elempack = 1;
+#if __riscv_vector
+            if (opt.use_packing_layout && int8_scale_term <= 100)
+            {
+                const int packn_fp32 = std::max(1, csrr_vlenb() / 4);
+                if (num_output % packn_fp32 == 0)
+                    requested_out_elempack = packn_fp32;
+            }
+#endif
+            const int in_elempack = bottom_blob_fp32.elempack;
+            const int bottom_scalar_elemsize = in_elempack > 0 ? (int)(bottom_blob_fp32.elemsize / (size_t)in_elempack) : 0;
+            riscv_int8_packing_audit_record(kernel_w, kernel_h, stride_w, stride_h, dilation_w, dilation_h,
+                                            in_elempack, bottom_scalar_elemsize, requested_out_elempack, activation_type);
         }
 
         Option opt_unpacked = opt;
