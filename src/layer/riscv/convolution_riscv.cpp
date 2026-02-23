@@ -29,6 +29,7 @@ namespace ncnn {
 struct riscv_int8_coverage_counters_t
 {
     std::atomic<unsigned long long> conv_int8_pack1_1x1_fast_count{0};
+    std::atomic<unsigned long long> conv_int8_packn_1x1_fast_count{0};
     std::atomic<unsigned long long> conv_int8_pack1_3x3s1_fast_count{0};
     std::atomic<unsigned long long> conv_int8_pack1_3x3s2_fast_count{0};
     std::atomic<unsigned long long> conv_int8_packout_used_count{0};
@@ -81,11 +82,12 @@ static void riscv_int8_coverage_dump()
         return v.load(std::memory_order_relaxed);
     };
 
-    NCNN_LOGE("riscv_int8_coverage conv_int8_pack1_1x1_fast_count=%llu conv_int8_pack1_3x3s1_fast_count=%llu conv_int8_pack1_3x3s2_fast_count=%llu conv_int8_packout_used_count=%llu conv_int8_packout_forced_pack1_count=%llu conv_int8_packout_blocked_activation_count=%llu conv_int8_packout_q_omp_used_count=%llu conv_int8_packout_q_omp_forced_oldmap_count=%llu packout_store_vsse32_count=%llu packout_store_vsseg_count=%llu s2_load_vlse8_count=%llu s2_load_vlseg2_count=%llu post_vrvv_used_count=%llu post_scalar_used_count=%llu conv_int8_fallback_count=%llu "
+    NCNN_LOGE("riscv_int8_coverage conv_int8_pack1_1x1_fast_count=%llu conv_int8_packn_1x1_fast_count=%llu conv_int8_pack1_3x3s1_fast_count=%llu conv_int8_pack1_3x3s2_fast_count=%llu conv_int8_packout_used_count=%llu conv_int8_packout_forced_pack1_count=%llu conv_int8_packout_blocked_activation_count=%llu conv_int8_packout_q_omp_used_count=%llu conv_int8_packout_q_omp_forced_oldmap_count=%llu packout_store_vsse32_count=%llu packout_store_vsseg_count=%llu s2_load_vlse8_count=%llu s2_load_vlseg2_count=%llu post_vrvv_used_count=%llu post_scalar_used_count=%llu conv_int8_fallback_count=%llu "
               "fallback_reason_dims_ne3=%llu fallback_reason_dilation_ne1=%llu fallback_reason_stride_not_1_or_2=%llu fallback_reason_kernel_not_1_or_3=%llu "
               "fallback_reason_group_or_channel_mismatch=%llu fallback_reason_int8_scale_term_0=%llu fallback_reason_int8_uniform_false=%llu fallback_reason_bottom_elempack_ne1=%llu "
               "fallback_reason_disable_global=%llu fallback_reason_disable_prep=%llu fallback_reason_disable_1x1=%llu fallback_reason_disable_3x3s1=%llu fallback_reason_disable_3x3s2=%llu",
               load(g_riscv_int8_coverage_counters.conv_int8_pack1_1x1_fast_count),
+              load(g_riscv_int8_coverage_counters.conv_int8_packn_1x1_fast_count),
               load(g_riscv_int8_coverage_counters.conv_int8_pack1_3x3s1_fast_count),
               load(g_riscv_int8_coverage_counters.conv_int8_pack1_3x3s2_fast_count),
               load(g_riscv_int8_coverage_counters.conv_int8_packout_used_count),
@@ -242,6 +244,26 @@ static inline int riscv_int8_conv1x1_disabled()
     static const int g_disable = []() -> int
     {
         const char* env = getenv("NCNN_RISCV_INT8_CONV_DISABLE_1X1");
+        return (env && env[0] != '\0' && env[0] != '0') ? 1 : 0;
+    }();
+    return g_disable;
+}
+
+static inline int riscv_int8_conv_packn_disabled()
+{
+    static const int g_disable = []() -> int
+    {
+        const char* env = getenv("NCNN_RISCV_INT8_CONV_PACKN_DISABLE");
+        return (env && env[0] != '\0' && env[0] != '0') ? 1 : 0;
+    }();
+    return g_disable;
+}
+
+static inline int riscv_int8_conv1x1_packn_disabled()
+{
+    static const int g_disable = []() -> int
+    {
+        const char* env = getenv("NCNN_RISCV_INT8_CONV_1X1_PACKN_DISABLE");
         return (env && env[0] != '\0' && env[0] != '0') ? 1 : 0;
     }();
     return g_disable;
@@ -585,6 +607,33 @@ static int quantize_to_int8_pack1(const Mat& src, Mat& dst, float scale, const O
     return 0;
 }
 
+static int quantize_to_int8_packed(const Mat& src, Mat& dst, float scale, const Option& opt)
+{
+    const int w = src.w;
+    const int h = src.h;
+    const int channels = src.c;
+    const int elempack = src.elempack;
+
+    dst.create(w, h, channels, (size_t)1u * elempack, elempack, opt.blob_allocator);
+    if (dst.empty())
+        return -100;
+
+    #pragma omp parallel for num_threads(opt.num_threads)
+    for (int q = 0; q < channels; q++)
+    {
+        const float* ptr = src.channel(q);
+        signed char* outptr = dst.channel(q);
+
+        const int size = w * h * elempack;
+        for (int i = 0; i < size; i++)
+        {
+            outptr[i] = float2int8_rvv(ptr[i] * scale);
+        }
+    }
+
+    return 0;
+}
+
 #if NCNN_RISCV_INT8_CONV_STATS
 static std::atomic<int> g_riscv_int8_elemsize_1(0);
 static std::atomic<int> g_riscv_int8_elemsize_2(0);
@@ -676,10 +725,38 @@ int Convolution_riscv::create_pipeline(const Option& opt)
 
     activation = create_activation_layer(activation_type, activation_params, opt);
 
+    const int maxk = kernel_w * kernel_h;
+    const int num_input = weight_data_size / maxk / num_output;
+
 #if NCNN_INT8
     if (opt.use_int8_inference && weight_data.elemsize == (size_t)1u)
     {
-        // TODO implement int8
+#if __riscv_vector
+        weight_data_int8_1x1_packn_tm.release();
+
+        const int packn_fp32 = std::max(1, csrr_vlenb() / 4);
+        if (kernel_w == 1 && kernel_h == 1 && stride_w == 1 && stride_h == 1 && dilation_w == 1 && dilation_h == 1
+            && num_input % packn_fp32 == 0 && num_output % packn_fp32 == 0)
+        {
+            weight_data_int8_1x1_packn_tm.create(num_input * packn_fp32, num_output / packn_fp32, (size_t)1u);
+            if (weight_data_int8_1x1_packn_tm.empty())
+                return -100;
+
+            const signed char* kptr = (const signed char*)weight_data;
+            for (int g = 0; g < num_output / packn_fp32; g++)
+            {
+                signed char* gptr = weight_data_int8_1x1_packn_tm.row<signed char>(g);
+                for (int q = 0; q < num_input; q++)
+                {
+                    for (int lane = 0; lane < packn_fp32; lane++)
+                    {
+                        const int p = g * packn_fp32 + lane;
+                        gptr[q * packn_fp32 + lane] = kptr[(size_t)p * num_input + q];
+                    }
+                }
+            }
+        }
+#endif
         return 0;
     }
 #endif
@@ -694,9 +771,6 @@ int Convolution_riscv::create_pipeline(const Option& opt)
 #if __riscv_vector
     const int packn = csrr_vlenb() / 4;
 #endif
-
-    const int maxk = kernel_w * kernel_h;
-    const int num_input = weight_data_size / maxk / num_output;
 
     int elempack = 1;
     int out_elempack = 1;
@@ -797,6 +871,10 @@ int Convolution_riscv::destroy_pipeline(const Option& opt)
         delete activation;
         activation = 0;
     }
+
+#if NCNN_INT8
+    weight_data_int8_1x1_packn_tm.release();
+#endif
 
     return 0;
 }
@@ -1014,8 +1092,54 @@ int Convolution_riscv::forward(const Mat& bottom_blob, Mat& top_blob, const Opti
             return ensure_pack1(bottom_blob_int8_pack1);
         };
 
+        auto prepare_int8_packed = [&](Mat& bottom_blob_int8_packed, int target_elempack) -> int
+        {
+            if (riscv_int8_conv_prep_disabled())
+                return -100;
+
+            if (target_elempack <= 1)
+                return -100;
+
+            if (bottom_blob_fp32.elembits() == 8)
+            {
+                bottom_blob_int8_packed = bottom_blob_fp32;
+                if (bottom_blob_int8_packed.elempack == target_elempack)
+                    return 0;
+
+                Option opt_pack = opt;
+                opt_pack.blob_allocator = opt.workspace_allocator;
+                Mat tmp;
+                convert_packing(bottom_blob_int8_packed, tmp, target_elempack, opt_pack);
+                if (tmp.empty())
+                    return -100;
+                bottom_blob_int8_packed = tmp;
+                return 0;
+            }
+
+            Mat bottom_blob_fp32_packed = bottom_blob_fp32;
+            if (bottom_blob_fp32_packed.elempack != target_elempack)
+            {
+                Option opt_pack = opt;
+                opt_pack.blob_allocator = opt.workspace_allocator;
+
+                Mat tmp;
+                convert_packing(bottom_blob_fp32, tmp, target_elempack, opt_pack);
+                if (tmp.empty())
+                    return -100;
+
+                bottom_blob_fp32_packed = tmp;
+            }
+
+            Option opt_q = opt;
+            // Temporary packed int8 input is short-lived and should come from workspace allocator.
+            opt_q.blob_allocator = opt.workspace_allocator;
+            return quantize_to_int8_packed(bottom_blob_fp32_packed, bottom_blob_int8_packed, bottom_blob_int8_scales[0], opt_q);
+        };
+
         const int disable_rvv_int8_conv = riscv_int8_conv_disabled();
         const int disable_rvv_int8_conv1x1 = riscv_int8_conv1x1_disabled();
+        const int disable_rvv_int8_conv_packn = riscv_int8_conv_packn_disabled();
+        const int disable_rvv_int8_conv1x1_packn = riscv_int8_conv1x1_packn_disabled();
         const int disable_rvv_int8_conv3x3 = riscv_int8_conv3x3_disabled();
         const int disable_rvv_int8_conv3x3s1 = riscv_int8_conv3x3s1_disabled();
         const int disable_rvv_int8_conv3x3s2 = riscv_int8_conv3x3s2_disabled();
@@ -1035,6 +1159,144 @@ int Convolution_riscv::forward(const Mat& bottom_blob, Mat& top_blob, const Opti
 
         if (!disable_rvv_int8_conv && !disable_rvv_int8_conv1x1 && !disable_rvv_int8_prep && int8_uniform && bottom_blob_fp32.dims == 3 && num_input == channels_unpacked && kernel_w == 1 && kernel_h == 1 && dilation_w == 1 && dilation_h == 1 && stride_w == 1 && stride_h == 1)
         {
+            {
+                const int vlenb = csrr_vlenb();
+                const int packn_fp32 = std::max(1, vlenb / 4);
+                const int in_elempack = bottom_blob_fp32.elempack;
+                const bool use_int8_requantize = int8_scale_term > 100;
+                const bool packout_layout_candidate = opt.use_packing_layout && !use_int8_requantize && num_output % packn_fp32 == 0;
+                const bool packout_candidate = packout_layout_candidate && activation_type == 0;
+                if (packing_audit_enabled)
+                {
+                    const int bottom_scalar_elemsize = in_elempack > 0 ? (int)(bottom_blob_fp32.elemsize / (size_t)in_elempack) : 0;
+                    riscv_int8_packing_audit_record(kernel_w, kernel_h, stride_w, stride_h, dilation_w, dilation_h,
+                                                    in_elempack, bottom_scalar_elemsize, packout_layout_candidate ? packn_fp32 : 1, activation_type);
+                }
+
+                if (!disable_rvv_int8_conv_packn && !disable_rvv_int8_conv1x1_packn
+                    && !disable_rvv_int8_packout && !disable_rvv_int8_packout_omp_q
+                    && !use_int8_requantize && packout_candidate
+                    && packn_fp32 <= 8
+                    && in_elempack > 1 && num_input % in_elempack == 0
+                    && !weight_data_int8_1x1_packn_tm.empty())
+                {
+                    Mat bottom_blob_unbordered_packn;
+                    if (prepare_int8_packed(bottom_blob_unbordered_packn, in_elempack) == 0)
+                    {
+                        Mat bottom_blob_bordered_packn;
+                        Option opt_pad = opt;
+                        make_padding(bottom_blob_unbordered_packn, bottom_blob_bordered_packn, opt_pad);
+                        if (!bottom_blob_bordered_packn.empty() && bottom_blob_bordered_packn.elempack == in_elempack)
+                        {
+                            const int w = bottom_blob_bordered_packn.w;
+                            const int h = bottom_blob_bordered_packn.h;
+                            const int channels = bottom_blob_bordered_packn.c;
+                            if (channels * in_elempack == num_input)
+                            {
+                                const int kernel_extent_w = dilation_w * (kernel_w - 1) + 1;
+                                const int kernel_extent_h = dilation_h * (kernel_h - 1) + 1;
+                                const int outw = (w - kernel_extent_w) / stride_w + 1;
+                                const int outh = (h - kernel_extent_h) / stride_h + 1;
+                                const int out_elempack = packn_fp32;
+
+                                top_blob.create(outw, outh, num_output / out_elempack, (size_t)4u * out_elempack, out_elempack, opt.blob_allocator);
+                                if (top_blob.empty())
+                                    return -100;
+
+                                if (coverage_enabled)
+                                {
+                                    g_riscv_int8_coverage_counters.conv_int8_packout_used_count.fetch_add(1, std::memory_order_relaxed);
+                                    g_riscv_int8_coverage_counters.conv_int8_packout_q_omp_used_count.fetch_add(1, std::memory_order_relaxed);
+                                }
+
+                                #pragma omp parallel num_threads(opt.num_threads)
+                                {
+                                    int* sums_lanes[16];
+                                    for (int lane = 0; lane < out_elempack; lane++)
+                                        sums_lanes[lane] = riscv_get_sums_buffer_slot((size_t)vlenb, lane);
+
+                                    #pragma omp for schedule(static)
+                                    for (int qg = 0; qg < num_output / out_elempack; qg++)
+                                    {
+                                        Mat outc = top_blob.channel(qg);
+                                        const int p0 = qg * out_elempack;
+                                        const signed char* kptr_group = weight_data_int8_1x1_packn_tm.row<const signed char>(qg);
+                                        const int force_fma = riscv_int8_conv_force_fma();
+                                        const int no_fma = riscv_int8_conv_no_fma();
+
+                                        float scale_in_lanes[16];
+                                        float bias_lanes[16];
+                                        for (int lane = 0; lane < out_elempack; lane++)
+                                        {
+                                            const int p = p0 + lane;
+                                            scale_in_lanes[lane] = weight_data_int8_scales[p] != 0 ? 1.f / (bottom_blob_int8_scales[0] * weight_data_int8_scales[p]) : 0.f;
+                                            bias_lanes[lane] = bias_term ? bias_data[p] : 0.f;
+                                        }
+
+                                        for (int i = 0; i < outh; i++)
+                                        {
+                                            float* outptr = outc.row<float>(i);
+
+                                            for (int j = 0; j < outw; )
+                                            {
+                                                size_t vl = __riscv_vsetvl_e8m1(outw - j);
+                                                vint32m4_t _sum0 = __riscv_vmv_v_x_i32m4(0, vl);
+                                                vint32m4_t _sum1 = __riscv_vmv_v_x_i32m4(0, vl);
+                                                vint32m4_t _sum2 = __riscv_vmv_v_x_i32m4(0, vl);
+                                                vint32m4_t _sum3 = __riscv_vmv_v_x_i32m4(0, vl);
+                                                vint32m4_t _sum4 = __riscv_vmv_v_x_i32m4(0, vl);
+                                                vint32m4_t _sum5 = __riscv_vmv_v_x_i32m4(0, vl);
+                                                vint32m4_t _sum6 = __riscv_vmv_v_x_i32m4(0, vl);
+                                                vint32m4_t _sum7 = __riscv_vmv_v_x_i32m4(0, vl);
+
+                                                for (int q = 0; q < channels; q++)
+                                                {
+                                                    const signed char* sptr = bottom_blob_bordered_packn.channel(q).row<signed char>(i) + (size_t)j * in_elempack;
+                                                    const signed char* kptr_q = kptr_group + (size_t)q * in_elempack * out_elempack;
+
+                                                    for (int k = 0; k < in_elempack; k++)
+                                                    {
+                                                        vint8m1_t _val8 = __riscv_vlse8_v_i8m1(sptr + k, in_elempack, vl);
+                                                        vint16m2_t _val16 = __riscv_vsext_vf2_i16m2(_val8, vl);
+                                                        const signed char* kptr_qk = kptr_q + (size_t)k * out_elempack;
+                                                        if (out_elempack > 0) _sum0 = __riscv_vwmacc_vx_i32m4(_sum0, (short)kptr_qk[0], _val16, vl);
+                                                        if (out_elempack > 1) _sum1 = __riscv_vwmacc_vx_i32m4(_sum1, (short)kptr_qk[1], _val16, vl);
+                                                        if (out_elempack > 2) _sum2 = __riscv_vwmacc_vx_i32m4(_sum2, (short)kptr_qk[2], _val16, vl);
+                                                        if (out_elempack > 3) _sum3 = __riscv_vwmacc_vx_i32m4(_sum3, (short)kptr_qk[3], _val16, vl);
+                                                        if (out_elempack > 4) _sum4 = __riscv_vwmacc_vx_i32m4(_sum4, (short)kptr_qk[4], _val16, vl);
+                                                        if (out_elempack > 5) _sum5 = __riscv_vwmacc_vx_i32m4(_sum5, (short)kptr_qk[5], _val16, vl);
+                                                        if (out_elempack > 6) _sum6 = __riscv_vwmacc_vx_i32m4(_sum6, (short)kptr_qk[6], _val16, vl);
+                                                        if (out_elempack > 7) _sum7 = __riscv_vwmacc_vx_i32m4(_sum7, (short)kptr_qk[7], _val16, vl);
+                                                    }
+                                                }
+
+                                                if (out_elempack > 0) __riscv_vse32_v_i32m4(sums_lanes[0], _sum0, vl);
+                                                if (out_elempack > 1) __riscv_vse32_v_i32m4(sums_lanes[1], _sum1, vl);
+                                                if (out_elempack > 2) __riscv_vse32_v_i32m4(sums_lanes[2], _sum2, vl);
+                                                if (out_elempack > 3) __riscv_vse32_v_i32m4(sums_lanes[3], _sum3, vl);
+                                                if (out_elempack > 4) __riscv_vse32_v_i32m4(sums_lanes[4], _sum4, vl);
+                                                if (out_elempack > 5) __riscv_vse32_v_i32m4(sums_lanes[5], _sum5, vl);
+                                                if (out_elempack > 6) __riscv_vse32_v_i32m4(sums_lanes[6], _sum6, vl);
+                                                if (out_elempack > 7) __riscv_vse32_v_i32m4(sums_lanes[7], _sum7, vl);
+
+                                                riscv_int8_store_fp32_packx_from_sums(outptr + (size_t)j * out_elempack, sums_lanes, out_elempack, (int)vl, scale_in_lanes, bias_lanes, bias_term, force_fma, no_fma, disable_rvv_int8_packout_segstore, disable_rvv_int8_post_vrvv, coverage_enabled);
+
+                                                j += (int)vl;
+                                            }
+                                        }
+                                    }
+                                }
+
+                                if (coverage_enabled)
+                                    g_riscv_int8_coverage_counters.conv_int8_packn_1x1_fast_count.fetch_add(1, std::memory_order_relaxed);
+
+                                return 0;
+                            }
+                        }
+                    }
+                }
+            }
+
             Mat bottom_blob_unbordered;
             if (prepare_int8_pack1(bottom_blob_unbordered) != 0)
                 return -100;

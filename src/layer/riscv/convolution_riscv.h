@@ -34,6 +34,9 @@ public:
     Mat weight_winograd23_data;
     Mat weight_winograd43_data;
     Mat weight_winograd63_data;
+#if NCNN_INT8
+    Mat weight_data_int8_1x1_packn_tm;
+#endif
 
     // fp16
     Mat bias_data_fp16;
