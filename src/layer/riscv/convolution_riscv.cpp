@@ -307,6 +307,16 @@ static inline int riscv_int8_conv3x3s1_packn_disabled()
     return g_disable;
 }
 
+static inline int riscv_int8_conv3x3s1_packn_enabled()
+{
+    static const int g_enable = []() -> int
+    {
+        const char* env = getenv("NCNN_RISCV_INT8_CONV_3X3S1_PACKN_ENABLE");
+        return (env && env[0] != '\0' && env[0] != '0') ? 1 : 0;
+    }();
+    return g_enable;
+}
+
 static inline int riscv_int8_conv3x3s2_disabled()
 {
     static const int g_disable = []() -> int
@@ -1189,6 +1199,7 @@ int Convolution_riscv::forward(const Mat& bottom_blob, Mat& top_blob, const Opti
         const int disable_rvv_int8_conv3x3 = riscv_int8_conv3x3_disabled();
         const int disable_rvv_int8_conv3x3s1 = riscv_int8_conv3x3s1_disabled();
         const int disable_rvv_int8_conv3x3s1_packn = riscv_int8_conv3x3s1_packn_disabled();
+        const int enable_rvv_int8_conv3x3s1_packn = riscv_int8_conv3x3s1_packn_enabled();
         const int disable_rvv_int8_conv3x3s2 = riscv_int8_conv3x3s2_disabled();
         const int disable_rvv_int8_prep = riscv_int8_conv_prep_disabled();
         const int disable_rvv_int8_post_vrvv = riscv_int8_conv_post_vrvv_disabled();
@@ -1667,7 +1678,7 @@ int Convolution_riscv::forward(const Mat& bottom_blob, Mat& top_blob, const Opti
             const int vlenb_packn = csrr_vlenb();
             const int packn_fp32_packn = std::max(1, vlenb_packn / 4);
             const bool packout_layout_candidate_packn = opt.use_packing_layout && !use_int8_requantize_packn && num_output % packn_fp32_packn == 0;
-            if (!disable_rvv_int8_conv_packn && !disable_rvv_int8_conv3x3s1_packn
+            if (!disable_rvv_int8_conv_packn && !disable_rvv_int8_conv3x3s1_packn && enable_rvv_int8_conv3x3s1_packn
                 && !disable_rvv_int8_packout && !disable_rvv_int8_packout_omp_q
                 && packn_fp32_packn <= 8
                 && in_elempack > 1 && num_input % in_elempack == 0
