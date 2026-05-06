@@ -174,6 +174,16 @@ ncnn_add_layer(Flip)
 ncnn_add_layer(SDPA)
 ncnn_add_layer(RotaryEmbed)
 
+if(NCNN_TARGET_ARCH STREQUAL "riscv")
+    enable_language(ASM)
+    list(APPEND ncnn_SRCS
+        ${CMAKE_CURRENT_SOURCE_DIR}/layer/riscv/convolution_1x1_int8_xsmtvdot.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/layer/riscv/convolution_1x1_int8_xsmtvdot.S
+    )
+    set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/layer/riscv/convolution_1x1_int8_xsmtvdot.S
+        PROPERTIES COMPILE_FLAGS "-mcpu=spacemit-x60 -mabi=lp64d")
+endif()
+
 if(NCNN_VULKAN)
     ncnn_add_shader(${CMAKE_CURRENT_SOURCE_DIR}/convert_ycbcr.comp)
     ncnn_add_shader(${CMAKE_CURRENT_SOURCE_DIR}/layer/vulkan/shader/vulkan_activation.comp)

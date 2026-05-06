@@ -22,6 +22,9 @@
 #endif // __riscv_vector
 #include "riscv_activation.h"
 #include "riscv_usability.h"
+#if NCNN_INT8
+#include "convolution_1x1_int8_xsmtvdot.h"
+#endif
 
 namespace ncnn {
 
@@ -762,6 +765,7 @@ int Convolution_riscv::create_pipeline(const Option& opt)
 #if __riscv_vector
         weight_data_int8_1x1_packn_tm.release();
         weight_data_int8_3x3s1_packn_tm.release();
+        weight_data_int8_1x1_xsmtvdot_tm.release();
 
         const int packn_fp32 = std::max(1, csrr_vlenb() / 4);
         if (kernel_w == 1 && kernel_h == 1 && stride_w == 1 && stride_h == 1 && dilation_w == 1 && dilation_h == 1
@@ -810,6 +814,13 @@ int Convolution_riscv::create_pipeline(const Option& opt)
                     }
                 }
             }
+        }
+
+        if (kernel_w == 1 && kernel_h == 1 && stride_w == 1 && stride_h == 1 && dilation_w == 1 && dilation_h == 1)
+        {
+            int ret = convolution_1x1_int8_xsmtvdot_create_weight_tm(weight_data, weight_data_int8_1x1_xsmtvdot_tm, num_input, num_output);
+            if (ret != 0)
+                return ret;
         }
 #endif
         return 0;
@@ -930,6 +941,7 @@ int Convolution_riscv::destroy_pipeline(const Option& opt)
 #if NCNN_INT8
     weight_data_int8_1x1_packn_tm.release();
     weight_data_int8_3x3s1_packn_tm.release();
+    weight_data_int8_1x1_xsmtvdot_tm.release();
 #endif
 
     return 0;
@@ -1419,6 +1431,29 @@ int Convolution_riscv::forward(const Mat& bottom_blob, Mat& top_blob, const Opti
             }
             const int out_elempack = (packout_candidate && !disable_rvv_int8_packout) ? packn_fp32 : 1;
             size_t out_elemsize = (use_int8_requantize ? (size_t)1u : (size_t)4u) * out_elempack;
+
+            if (out_elempack == 1 && !weight_data_int8_1x1_xsmtvdot_tm.empty())
+            {
+                int xsmtvdot_ret = convolution_1x1_int8_xsmtvdot_forward(bottom_blob_bordered, top_blob,
+                                                                         weight_data_int8_1x1_xsmtvdot_tm,
+                                                                         bias_data,
+                                                                         bottom_blob_int8_scales,
+                                                                         weight_data_int8_scales,
+                                                                         top_blob_int8_scales,
+                                                                         bias_term,
+                                                                         int8_scale_term,
+                                                                         activation_type,
+                                                                         num_output,
+                                                                         opt);
+                if (xsmtvdot_ret == 0)
+                {
+                    if (coverage_enabled)
+                        g_riscv_int8_coverage_counters.conv_int8_pack1_1x1_fast_count.fetch_add(1, std::memory_order_relaxed);
+                    return 0;
+                }
+                if (xsmtvdot_ret < 0)
+                    return xsmtvdot_ret;
+            }
 
             top_blob.create(outw, outh, num_output / out_elempack, out_elemsize, out_elempack, opt.blob_allocator);
             if (top_blob.empty())
