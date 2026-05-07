@@ -64,6 +64,19 @@ int convolution_1x1_int8_xsmtvdot_create_weight_tm(const Mat& weight_data, Mat& 
     return 0;
 }
 
+int convolution_1x1_int8_xsmtvdot_pipeline_enabled(void)
+{
+    const char* enable = getenv("NCNN_RISCV_INT8_XSMTVDOT_1X1_ENABLE");
+    if (!enable || enable[0] == '\0' || enable[0] == '0')
+        return 0;
+
+    const char* affinity_confirmed = getenv("NCNN_RISCV_INT8_XSMTVDOT_CLUSTER0_AFFINITY_CONFIRMED");
+    if (!affinity_confirmed || affinity_confirmed[0] != '1')
+        return 0;
+
+    return 1;
+}
+
 #if defined(__riscv) && defined(__linux__)
 static thread_local sigjmp_buf g_xsmtvdot_sigjmp;
 static thread_local volatile sig_atomic_t g_xsmtvdot_sigill_seen = 0;

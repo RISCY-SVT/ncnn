@@ -16,6 +16,8 @@ namespace ncnn {
 
 int convolution_1x1_int8_xsmtvdot_create_weight_tm(const Mat& weight_data, Mat& weight_data_tm, int num_input, int num_output);
 
+int convolution_1x1_int8_xsmtvdot_pipeline_enabled(void);
+
 int convolution_1x1_int8_xsmtvdot_forward(const Mat& bottom_blob_int8,
                                           Mat& top_blob,
                                           const Mat& weight_data_tm,
