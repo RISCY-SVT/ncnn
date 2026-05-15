@@ -115,6 +115,8 @@ NCNN_EXPORT int cpu_support_riscv_zfh();
 NCNN_EXPORT int cpu_support_riscv_zvfh();
 // xtheadvector = riscv xtheadvector
 NCNN_EXPORT int cpu_support_riscv_xtheadvector();
+// spacemit xsmtvdot = SpacemiT XSMTVDot / VMADot visibility probe
+NCNN_EXPORT int cpu_support_k1x_xsmtvdot();
 // vlenb = riscv vector length in bytes
 NCNN_EXPORT int cpu_riscv_vlenb();
 

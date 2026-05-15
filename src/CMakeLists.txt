@@ -177,6 +177,7 @@ ncnn_add_layer(RotaryEmbed)
 if(NCNN_TARGET_ARCH STREQUAL "riscv")
     enable_language(ASM)
     list(APPEND ncnn_SRCS
+        ${CMAKE_CURRENT_SOURCE_DIR}/k1x_runtime_feature.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/layer/riscv/convolution_1x1_int8_xsmtvdot.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/layer/riscv/convolution_1x1_int8_xsmtvdot.S
     )

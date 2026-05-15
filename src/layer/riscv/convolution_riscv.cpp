@@ -816,7 +816,7 @@ int Convolution_riscv::create_pipeline(const Option& opt)
             }
         }
 
-        if (convolution_1x1_int8_xsmtvdot_pipeline_enabled()
+        if (convolution_1x1_int8_xsmtvdot_pipeline_enabled(opt, activation_type)
             && kernel_w == 1 && kernel_h == 1 && stride_w == 1 && stride_h == 1 && dilation_w == 1 && dilation_h == 1)
         {
             int ret = convolution_1x1_int8_xsmtvdot_create_weight_tm(weight_data, weight_data_int8_1x1_xsmtvdot_tm, num_input, num_output);

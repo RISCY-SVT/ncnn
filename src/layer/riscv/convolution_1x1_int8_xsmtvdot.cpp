@@ -3,16 +3,9 @@
 
 #include "convolution_1x1_int8_xsmtvdot.h"
 
-#include <cstdlib>
-#include <cstring>
-#include <vector>
+#include "k1x_runtime_feature.h"
 
-#if defined(__linux__)
-#include <sched.h>
-#include <setjmp.h>
-#include <signal.h>
-#include <unistd.h>
-#endif
+#include <vector>
 
 namespace ncnn {
 
@@ -64,172 +57,9 @@ int convolution_1x1_int8_xsmtvdot_create_weight_tm(const Mat& weight_data, Mat& 
     return 0;
 }
 
-int convolution_1x1_int8_xsmtvdot_pipeline_enabled(void)
+int convolution_1x1_int8_xsmtvdot_pipeline_enabled(const Option& opt, int activation_type)
 {
-    const char* enable = getenv("NCNN_RISCV_INT8_XSMTVDOT_1X1_ENABLE");
-    if (!enable || enable[0] == '\0' || enable[0] == '0')
-        return 0;
-
-    const char* affinity_confirmed = getenv("NCNN_RISCV_INT8_XSMTVDOT_CLUSTER0_AFFINITY_CONFIRMED");
-    if (!affinity_confirmed || affinity_confirmed[0] != '1')
-        return 0;
-
-    return 1;
-}
-
-#if defined(__riscv) && defined(__linux__)
-static thread_local sigjmp_buf g_xsmtvdot_sigjmp;
-static thread_local volatile sig_atomic_t g_xsmtvdot_sigill_seen = 0;
-
-static void xsmtvdot_sigill_handler(int signo, siginfo_t* info, void* uctx)
-{
-    (void)signo;
-    (void)info;
-    (void)uctx;
-    g_xsmtvdot_sigill_seen = 1;
-    siglongjmp(g_xsmtvdot_sigjmp, 1);
-}
-
-static int parse_cpu_list(const char* text, cpu_set_t* set)
-{
-    const char* p = text;
-    CPU_ZERO(set);
-
-    if (!text || text[0] == '\0')
-        return -1;
-
-    while (*p)
-    {
-        char* end = 0;
-        long first = strtol(p, &end, 10);
-        long last = first;
-        if (end == p || first < 0 || first >= CPU_SETSIZE)
-            return -1;
-
-        if (*end == '-')
-        {
-            p = end + 1;
-            last = strtol(p, &end, 10);
-            if (end == p || last < first || last >= CPU_SETSIZE)
-                return -1;
-        }
-
-        for (long cpu = first; cpu <= last; cpu++)
-            CPU_SET((int)cpu, set);
-
-        if (*end == ',')
-            p = end + 1;
-        else if (*end == '\0')
-            p = end;
-        else
-            return -1;
-    }
-
-    return 0;
-}
-
-static int cluster0_set(cpu_set_t* set)
-{
-    const char* env = getenv("NCNN_RISCV_INT8_XSMTVDOT_CLUSTER0_CPUS");
-    if (env && env[0] != '\0')
-        return parse_cpu_list(env, set);
-
-    CPU_ZERO(set);
-    CPU_SET(0, set);
-    CPU_SET(1, set);
-    CPU_SET(2, set);
-    CPU_SET(3, set);
-    return 0;
-}
-
-static int cpu_is_in_set(int cpu, const cpu_set_t* set)
-{
-    return cpu >= 0 && cpu < CPU_SETSIZE && CPU_ISSET(cpu, set);
-}
-
-static int observed_affinity_is_cluster0_only(const cpu_set_t* observed, const cpu_set_t* cluster0)
-{
-    int any = 0;
-    for (int cpu = 0; cpu < CPU_SETSIZE; cpu++)
-    {
-        if (!CPU_ISSET(cpu, observed))
-            continue;
-
-        any = 1;
-        if (!CPU_ISSET(cpu, cluster0))
-            return 0;
-    }
-
-    return any;
-}
-
-static int xsmtvdot_canary_ok()
-{
-    struct sigaction sa;
-    struct sigaction old_sa;
-    std::memset(&sa, 0, sizeof(sa));
-    sa.sa_sigaction = xsmtvdot_sigill_handler;
-    sa.sa_flags = SA_SIGINFO;
-    sigemptyset(&sa.sa_mask);
-
-    if (sigaction(SIGILL, &sa, &old_sa) != 0)
-        return 0;
-
-    g_xsmtvdot_sigill_seen = 0;
-    int ok = 0;
-    if (sigsetjmp(g_xsmtvdot_sigjmp, 1) == 0)
-    {
-        ncnn_convolution_1x1_int8_xsmtvdot_canary();
-        ok = g_xsmtvdot_sigill_seen ? 0 : 1;
-    }
-
-    sigaction(SIGILL, &old_sa, 0);
-    return ok;
-}
-#endif
-
-int convolution_1x1_int8_xsmtvdot_runtime_ready(void)
-{
-#if defined(__riscv) && defined(__linux__)
-    const char* enable = getenv("NCNN_RISCV_INT8_XSMTVDOT_1X1_ENABLE");
-    if (!enable || enable[0] == '\0' || enable[0] == '0')
-        return 0;
-
-    const char* affinity_confirmed = getenv("NCNN_RISCV_INT8_XSMTVDOT_CLUSTER0_AFFINITY_CONFIRMED");
-    if (!affinity_confirmed || affinity_confirmed[0] != '1')
-        return 0;
-
-    cpu_set_t cluster0;
-    if (cluster0_set(&cluster0) != 0)
-        return 0;
-
-    cpu_set_t observed;
-    CPU_ZERO(&observed);
-    if (sched_getaffinity(0, sizeof(cpu_set_t), &observed) != 0)
-        return 0;
-    if (!observed_affinity_is_cluster0_only(&observed, &cluster0))
-        return 0;
-
-    const int cpu_before = sched_getcpu();
-    if (!cpu_is_in_set(cpu_before, &cluster0))
-        return 0;
-
-    static thread_local int canary_passed = 0;
-    if (!canary_passed)
-    {
-        if (!xsmtvdot_canary_ok())
-            return 0;
-        canary_passed = 1;
-    }
-
-    const int cpu_after = sched_getcpu();
-    if (!cpu_is_in_set(cpu_after, &cluster0))
-        return 0;
-
-    return 1;
-#else
-    return 0;
-#endif
+    return k1x_xsmtvdot_policy_allows(opt, activation_type, opt.num_threads, 1, 1);
 }
 
 int convolution_1x1_int8_xsmtvdot_forward(const Mat& bottom_blob_int8,
@@ -245,9 +75,6 @@ int convolution_1x1_int8_xsmtvdot_forward(const Mat& bottom_blob_int8,
                                           int num_output,
                                           const Option& opt)
 {
-    if (!convolution_1x1_int8_xsmtvdot_runtime_ready())
-        return 1;
-
     if (opt.num_threads != 1)
         return 1;
 

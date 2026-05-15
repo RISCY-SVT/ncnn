@@ -242,6 +242,7 @@ static int g_cpu_support_x86_avx512_fp16;
 static int g_cpu_support_riscv_zfh;
 static int g_cpu_support_riscv_zvfh;
 static int g_cpu_support_riscv_xtheadvector;
+static int g_cpu_support_k1x_xsmtvdot;
 #endif // __riscv
 #endif // defined __ANDROID__ || defined __linux__
 
@@ -2239,6 +2240,7 @@ static void initialize_global_cpu_info()
     g_cpu_support_riscv_zfh = ruapu_supports("zfh") || ruapu_supports("xtheadvector");   // xtheadvector implies zfh
     g_cpu_support_riscv_zvfh = ruapu_supports("zvfh") || ruapu_supports("xtheadvector"); // xtheadvector implies zvfh
     g_cpu_support_riscv_xtheadvector = ruapu_supports("xtheadvector");
+    g_cpu_support_k1x_xsmtvdot = ruapu_supports("spacemitvmadot");
 #endif // __riscv
 #endif // defined __ANDROID__ || defined __linux__
 
@@ -2894,6 +2896,20 @@ int cpu_support_riscv_xtheadvector()
 #if defined __ANDROID__ || defined __linux__
 #if __riscv
     return g_cpu_support_riscv_xtheadvector;
+#else
+    return 0;
+#endif
+#else
+    return 0;
+#endif
+}
+
+int cpu_support_k1x_xsmtvdot()
+{
+    try_initialize_global_cpu_info();
+#if defined __ANDROID__ || defined __linux__
+#if __riscv
+    return g_cpu_support_k1x_xsmtvdot;
 #else
     return 0;
 #endif
