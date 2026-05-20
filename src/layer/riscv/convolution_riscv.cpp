@@ -711,6 +711,9 @@ Convolution_riscv::Convolution_riscv()
 #endif
 
     activation = 0;
+#if NCNN_INT8
+    weight_data_int8_1x1_xsmtvdot_mode = CONVOLUTION_1X1_INT8_XSMTVDOT_PATH_NONE;
+#endif
 }
 
 static void convolution_transform_kernel_packed_rvv(const Mat& weight_data, Mat& weight_data_tm, int num_input, int num_output, int kernel_w, int kernel_h, int elempack, int out_elempack)
@@ -766,6 +769,7 @@ int Convolution_riscv::create_pipeline(const Option& opt)
         weight_data_int8_1x1_packn_tm.release();
         weight_data_int8_3x3s1_packn_tm.release();
         weight_data_int8_1x1_xsmtvdot_tm.release();
+        weight_data_int8_1x1_xsmtvdot_mode = CONVOLUTION_1X1_INT8_XSMTVDOT_PATH_NONE;
 
         const int packn_fp32 = std::max(1, csrr_vlenb() / 4);
         if (kernel_w == 1 && kernel_h == 1 && stride_w == 1 && stride_h == 1 && dilation_w == 1 && dilation_h == 1
@@ -816,12 +820,14 @@ int Convolution_riscv::create_pipeline(const Option& opt)
             }
         }
 
-        if (convolution_1x1_int8_xsmtvdot_pipeline_enabled(opt, activation_type)
+        const int xsmtvdot_pipeline_mode = convolution_1x1_int8_xsmtvdot_pipeline_mode(opt, activation_type);
+        if (xsmtvdot_pipeline_mode != CONVOLUTION_1X1_INT8_XSMTVDOT_PATH_NONE
             && kernel_w == 1 && kernel_h == 1 && stride_w == 1 && stride_h == 1 && dilation_w == 1 && dilation_h == 1)
         {
             int ret = convolution_1x1_int8_xsmtvdot_create_weight_tm(weight_data, weight_data_int8_1x1_xsmtvdot_tm, num_input, num_output);
             if (ret != 0)
                 return ret;
+            weight_data_int8_1x1_xsmtvdot_mode = weight_data_int8_1x1_xsmtvdot_tm.empty() ? CONVOLUTION_1X1_INT8_XSMTVDOT_PATH_NONE : xsmtvdot_pipeline_mode;
         }
 #endif
         return 0;
@@ -943,6 +949,7 @@ int Convolution_riscv::destroy_pipeline(const Option& opt)
     weight_data_int8_1x1_packn_tm.release();
     weight_data_int8_3x3s1_packn_tm.release();
     weight_data_int8_1x1_xsmtvdot_tm.release();
+    weight_data_int8_1x1_xsmtvdot_mode = CONVOLUTION_1X1_INT8_XSMTVDOT_PATH_NONE;
 #endif
 
     return 0;
@@ -1435,7 +1442,25 @@ int Convolution_riscv::forward(const Mat& bottom_blob, Mat& top_blob, const Opti
 
             if (out_elempack == 1 && !weight_data_int8_1x1_xsmtvdot_tm.empty())
             {
-                int xsmtvdot_ret = convolution_1x1_int8_xsmtvdot_forward(bottom_blob_bordered, top_blob,
+                int xsmtvdot_ret = 1;
+                if (weight_data_int8_1x1_xsmtvdot_mode == CONVOLUTION_1X1_INT8_XSMTVDOT_PATH_4X4K_APANEL_EXPERIMENTAL)
+                {
+                    xsmtvdot_ret = convolution_1x1_int8_xsmtvdot_forward_4x4k_apanel_experimental(bottom_blob_bordered, top_blob,
+                                                                                                  weight_data_int8_1x1_xsmtvdot_tm,
+                                                                                                  bias_data,
+                                                                                                  bottom_blob_int8_scales,
+                                                                                                  weight_data_int8_scales,
+                                                                                                  top_blob_int8_scales,
+                                                                                                  bias_term,
+                                                                                                  int8_scale_term,
+                                                                                                  activation_type,
+                                                                                                  num_output,
+                                                                                                  opt);
+                }
+                else if (weight_data_int8_1x1_xsmtvdot_mode == CONVOLUTION_1X1_INT8_XSMTVDOT_PATH_LEGACY
+                         && !convolution_1x1_int8_xsmtvdot_legacy_safety_gated(bottom_blob_bordered.w, bottom_blob_bordered.h, bottom_blob_bordered.c, num_output))
+                {
+                    xsmtvdot_ret = convolution_1x1_int8_xsmtvdot_forward(bottom_blob_bordered, top_blob,
                                                                          weight_data_int8_1x1_xsmtvdot_tm,
                                                                          bias_data,
                                                                          bottom_blob_int8_scales,
@@ -1446,6 +1471,7 @@ int Convolution_riscv::forward(const Mat& bottom_blob, Mat& top_blob, const Opti
                                                                          activation_type,
                                                                          num_output,
                                                                          opt);
+                }
                 if (xsmtvdot_ret == 0)
                 {
                     if (coverage_enabled)

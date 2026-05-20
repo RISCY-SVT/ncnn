@@ -5,6 +5,7 @@
 
 #include "k1x_runtime_feature.h"
 
+#include <cstdlib>
 #include <vector>
 
 namespace ncnn {
@@ -60,6 +61,27 @@ int convolution_1x1_int8_xsmtvdot_create_weight_tm(const Mat& weight_data, Mat& 
 int convolution_1x1_int8_xsmtvdot_pipeline_enabled(const Option& opt, int activation_type)
 {
     return k1x_xsmtvdot_policy_allows(opt, activation_type, opt.num_threads, 1, 1);
+}
+
+int convolution_1x1_int8_xsmtvdot_pipeline_mode(const Option& opt, int activation_type)
+{
+    if (!convolution_1x1_int8_xsmtvdot_pipeline_enabled(opt, activation_type))
+        return CONVOLUTION_1X1_INT8_XSMTVDOT_PATH_NONE;
+
+    const char* apanel_env = getenv("NCNN_RISCV_INT8_XSMTVDOT_4X4K_APANEL_ENABLE");
+    if (apanel_env && apanel_env[0] != '\0' && apanel_env[0] != '0')
+        return CONVOLUTION_1X1_INT8_XSMTVDOT_PATH_4X4K_APANEL_EXPERIMENTAL;
+
+    return CONVOLUTION_1X1_INT8_XSMTVDOT_PATH_LEGACY;
+}
+
+int convolution_1x1_int8_xsmtvdot_legacy_safety_gated(int w, int h, int channels, int num_output)
+{
+    const int size = w * h;
+
+    // H2 Lane A intentionally gates only the current legacy path for the
+    // Conv42-like small-spatial/high-channel regime identified by H0/H1.
+    return size > 0 && size <= 1600 && channels >= 384 && num_output >= 128;
 }
 
 int convolution_1x1_int8_xsmtvdot_forward(const Mat& bottom_blob_int8,
@@ -146,6 +168,116 @@ int convolution_1x1_int8_xsmtvdot_forward(const Mat& bottom_blob_int8,
                 ncnn_convolution_1x1_int8_xsmtvdot_4x4(apack, bpack_group + (size_t)kb * 32, partial);
                 for (int i = 0; i < 16; i++)
                     acc[i] += partial[i];
+            }
+
+            if (use_int8_requantize)
+            {
+                for (int n = 0; n < 4; n++)
+                {
+                    signed char* outptr = top_blob.channel(p0 + n).row<signed char>(0);
+                    for (int m = 0; m < 4; m++)
+                    {
+                        const float sumfp32 = (float)acc[m * 4 + n] * scale_in[n] + bias[n];
+                        outptr[s + m] = xsmtvdot_float2int8(sumfp32 * scale_out);
+                    }
+                }
+            }
+            else
+            {
+                for (int n = 0; n < 4; n++)
+                {
+                    float* outptr = top_blob.channel(p0 + n).row<float>(0);
+                    for (int m = 0; m < 4; m++)
+                        outptr[s + m] = (float)acc[m * 4 + n] * scale_in[n] + bias[n];
+                }
+            }
+        }
+    }
+
+    return 0;
+}
+
+int convolution_1x1_int8_xsmtvdot_forward_4x4k_apanel_experimental(const Mat& bottom_blob_int8,
+                                                                   Mat& top_blob,
+                                                                   const Mat& weight_data_tm,
+                                                                   const Mat& bias_data,
+                                                                   const Mat& bottom_blob_int8_scales,
+                                                                   const Mat& weight_data_int8_scales,
+                                                                   const Mat& top_blob_int8_scales,
+                                                                   int bias_term,
+                                                                   int int8_scale_term,
+                                                                   int activation_type,
+                                                                   int num_output,
+                                                                   const Option& opt)
+{
+    if (opt.num_threads != 1)
+        return 1;
+
+    if (activation_type != 0)
+        return 1;
+
+    if (bottom_blob_int8.dims != 3 || bottom_blob_int8.elempack != 1 || bottom_blob_int8.elemsize != (size_t)1u)
+        return 1;
+
+    const int w = bottom_blob_int8.w;
+    const int h = bottom_blob_int8.h;
+    const int channels = bottom_blob_int8.c;
+    const int size = w * h;
+
+    if (w <= 0 || h <= 0 || channels <= 0 || num_output <= 0)
+        return 1;
+    if (channels % 8 != 0 || num_output % 4 != 0 || size % 4 != 0)
+        return 1;
+    if (weight_data_tm.empty() || weight_data_tm.w != 32 * (channels / 8) || weight_data_tm.h != num_output / 4)
+        return 1;
+    if (bottom_blob_int8_scales.w != 1 || weight_data_int8_scales.w < num_output)
+        return 1;
+
+    const bool use_int8_requantize = int8_scale_term > 100;
+    if (use_int8_requantize && top_blob_int8_scales.w < 1)
+        return 1;
+
+    top_blob.create(w, h, num_output, use_int8_requantize ? (size_t)1u : (size_t)4u, opt.blob_allocator);
+    if (top_blob.empty())
+        return -100;
+
+    std::vector<const signed char*> inptrs(channels);
+    for (int q = 0; q < channels; q++)
+        inptrs[q] = bottom_blob_int8.channel(q).row<const signed char>(0);
+
+    const int kblocks = channels / 8;
+    std::vector<signed char> apanel((size_t)kblocks * 32);
+
+    const float bottom_scale = bottom_blob_int8_scales[0];
+    const float scale_out = use_int8_requantize ? top_blob_int8_scales[0] : 0.f;
+
+    for (int s = 0; s < size; s += 4)
+    {
+        for (int kb = 0; kb < kblocks; kb++)
+        {
+            signed char* ablock = apanel.data() + (size_t)kb * 32;
+            for (int m = 0; m < 4; m++)
+            {
+                for (int k = 0; k < 8; k++)
+                    ablock[m * 8 + k] = inptrs[kb * 8 + k][s + m];
+            }
+        }
+
+        for (int pg = 0; pg < num_output / 4; pg++)
+        {
+            const signed char* bpack_group = weight_data_tm.row<const signed char>(pg);
+            const int p0 = pg * 4;
+            int acc[16];
+
+            ncnn_convolution_1x1_int8_xsmtvdot_4x4_kloop(apanel.data(), bpack_group, kblocks, acc);
+
+            float scale_in[4];
+            float bias[4];
+            for (int n = 0; n < 4; n++)
+            {
+                const int p = p0 + n;
+                scale_in[n] = weight_data_int8_scales[p] != 0 ? 1.f / (bottom_scale * weight_data_int8_scales[p]) : 0.f;
+                bias[n] = bias_term ? bias_data[p] : 0.f;
             }
 
             if (use_int8_requantize)

@@ -38,6 +38,7 @@ public:
     Mat weight_data_int8_1x1_packn_tm;
     Mat weight_data_int8_3x3s1_packn_tm;
     Mat weight_data_int8_1x1_xsmtvdot_tm;
+    int weight_data_int8_1x1_xsmtvdot_mode;
 #endif
 
     // fp16
