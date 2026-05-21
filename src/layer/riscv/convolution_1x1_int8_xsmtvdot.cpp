@@ -5,8 +5,13 @@
 
 #include "k1x_runtime_feature.h"
 
+#include <cstddef>
 #include <cstdlib>
 #include <vector>
+
+#if __riscv_vector
+#include <riscv_vector.h>
+#endif // __riscv_vector
 
 namespace ncnn {
 
@@ -16,6 +21,48 @@ static inline signed char xsmtvdot_float2int8(float v)
     if (int32 > 127) return 127;
     if (int32 < -127) return -127;
     return (signed char)int32;
+}
+
+static inline void xsmtvdot_store_int8_tile_scalar(const int* acc, const float scale_in[4], const float bias[4], float scale_out, signed char* const outptrs[4], int s)
+{
+    for (int n = 0; n < 4; n++)
+    {
+        signed char* outptr = outptrs[n] + s;
+        for (int m = 0; m < 4; m++)
+        {
+            const float sumfp32 = (float)acc[m * 4 + n] * scale_in[n] + bias[n];
+            outptr[m] = xsmtvdot_float2int8(sumfp32 * scale_out);
+        }
+    }
+}
+
+static inline void xsmtvdot_store_fp32_tile(const int* acc, const float scale_in[4], const float bias[4], float* const outptrs[4], int s)
+{
+#if __riscv_vector
+    const ptrdiff_t acc_stride = (ptrdiff_t)(4 * sizeof(int));
+    for (int n = 0; n < 4; n++)
+    {
+        float* outptr = outptrs[n] + s;
+        int m = 0;
+        while (m < 4)
+        {
+            const size_t vl = __riscv_vsetvl_e32m1((size_t)(4 - m));
+            vint32m1_t _acc = __riscv_vlse32_v_i32m1(acc + m * 4 + n, acc_stride, vl);
+            vfloat32m1_t _sum = __riscv_vfcvt_f_x_v_f32m1(_acc, vl);
+            _sum = __riscv_vfmul_vf_f32m1(_sum, scale_in[n], vl);
+            _sum = __riscv_vfadd_vf_f32m1(_sum, bias[n], vl);
+            __riscv_vse32_v_f32m1(outptr + m, _sum, vl);
+            m += (int)vl;
+        }
+    }
+#else  // __riscv_vector
+    for (int n = 0; n < 4; n++)
+    {
+        float* outptr = outptrs[n] + s;
+        for (int m = 0; m < 4; m++)
+            outptr[m] = (float)acc[m * 4 + n] * scale_in[n] + bias[n];
+    }
+#endif // __riscv_vector
 }
 
 int convolution_1x1_int8_xsmtvdot_create_weight_tm(const Mat& weight_data, Mat& weight_data_tm, int num_input, int num_output)
@@ -150,15 +197,27 @@ int convolution_1x1_int8_xsmtvdot_forward(const Mat& bottom_blob_int8,
             bias[n] = bias_term ? bias_data[p] : 0.f;
         }
 
+        signed char* outptr_int8[4] = {0, 0, 0, 0};
+        float* outptr_fp32[4] = {0, 0, 0, 0};
+        if (use_int8_requantize)
+        {
+            for (int n = 0; n < 4; n++)
+                outptr_int8[n] = top_blob.channel(p0 + n).row<signed char>(0);
+        }
+        else
+        {
+            for (int n = 0; n < 4; n++)
+                outptr_fp32[n] = top_blob.channel(p0 + n).row<float>(0);
+        }
+
         for (int s = 0; s < size; s += 4)
         {
             int acc[16] = {0};
+            signed char apack[32];
+            int partial[16];
 
             for (int kb = 0; kb < kblocks; kb++)
             {
-                signed char apack[32];
-                int partial[16];
-
                 for (int m = 0; m < 4; m++)
                 {
                     for (int k = 0; k < 8; k++)
@@ -172,24 +231,11 @@ int convolution_1x1_int8_xsmtvdot_forward(const Mat& bottom_blob_int8,
 
             if (use_int8_requantize)
             {
-                for (int n = 0; n < 4; n++)
-                {
-                    signed char* outptr = top_blob.channel(p0 + n).row<signed char>(0);
-                    for (int m = 0; m < 4; m++)
-                    {
-                        const float sumfp32 = (float)acc[m * 4 + n] * scale_in[n] + bias[n];
-                        outptr[s + m] = xsmtvdot_float2int8(sumfp32 * scale_out);
-                    }
-                }
+                xsmtvdot_store_int8_tile_scalar(acc, scale_in, bias, scale_out, outptr_int8, s);
             }
             else
             {
-                for (int n = 0; n < 4; n++)
-                {
-                    float* outptr = top_blob.channel(p0 + n).row<float>(0);
-                    for (int m = 0; m < 4; m++)
-                        outptr[s + m] = (float)acc[m * 4 + n] * scale_in[n] + bias[n];
-                }
+                xsmtvdot_store_fp32_tile(acc, scale_in, bias, outptr_fp32, s);
             }
         }
     }
@@ -280,26 +326,26 @@ int convolution_1x1_int8_xsmtvdot_forward_4x4k_apanel_experimental(const Mat& bo
                 bias[n] = bias_term ? bias_data[p] : 0.f;
             }
 
+            signed char* outptr_int8[4] = {0, 0, 0, 0};
+            float* outptr_fp32[4] = {0, 0, 0, 0};
             if (use_int8_requantize)
             {
                 for (int n = 0; n < 4; n++)
-                {
-                    signed char* outptr = top_blob.channel(p0 + n).row<signed char>(0);
-                    for (int m = 0; m < 4; m++)
-                    {
-                        const float sumfp32 = (float)acc[m * 4 + n] * scale_in[n] + bias[n];
-                        outptr[s + m] = xsmtvdot_float2int8(sumfp32 * scale_out);
-                    }
-                }
+                    outptr_int8[n] = top_blob.channel(p0 + n).row<signed char>(0);
             }
             else
             {
                 for (int n = 0; n < 4; n++)
-                {
-                    float* outptr = top_blob.channel(p0 + n).row<float>(0);
-                    for (int m = 0; m < 4; m++)
-                        outptr[s + m] = (float)acc[m * 4 + n] * scale_in[n] + bias[n];
-                }
+                    outptr_fp32[n] = top_blob.channel(p0 + n).row<float>(0);
+            }
+
+            if (use_int8_requantize)
+            {
+                xsmtvdot_store_int8_tile_scalar(acc, scale_in, bias, scale_out, outptr_int8, s);
+            }
+            else
+            {
+                xsmtvdot_store_fp32_tile(acc, scale_in, bias, outptr_fp32, s);
             }
         }
     }
