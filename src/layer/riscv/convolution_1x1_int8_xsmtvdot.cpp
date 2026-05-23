@@ -23,8 +23,40 @@ static inline signed char xsmtvdot_float2int8(float v)
     return (signed char)int32;
 }
 
-static inline void xsmtvdot_store_int8_tile_scalar(const int* acc, const float scale_in[4], const float bias[4], float scale_out, signed char* const outptrs[4], int s)
+static inline void xsmtvdot_store_int8_tile(const int* acc, const float scale_in[4], const float bias[4], float scale_out, signed char* const outptrs[4], int s)
 {
+#if __riscv_vector
+    const ptrdiff_t acc_stride = (ptrdiff_t)(4 * sizeof(int));
+    for (int n = 0; n < 4; n++)
+    {
+        signed char* outptr = outptrs[n] + s;
+        int m = 0;
+        while (m < 4)
+        {
+            const size_t vl = __riscv_vsetvl_e32m1((size_t)(4 - m));
+            vint32m1_t _acc = __riscv_vlse32_v_i32m1(acc + m * 4 + n, acc_stride, vl);
+            vfloat32m1_t _sum = __riscv_vfcvt_f_x_v_f32m1(_acc, vl);
+            _sum = __riscv_vfmul_vf_f32m1(_sum, scale_in[n], vl);
+            _sum = __riscv_vfadd_vf_f32m1(_sum, bias[n], vl);
+            _sum = __riscv_vfmul_vf_f32m1(_sum, scale_out, vl);
+
+            // Match xsmtvdot_float2int8(): sign-dependent half-away offset,
+            // truncate toward zero, clamp to [-127, 127], then narrow/store.
+            const vbool32_t _negative = __riscv_vmflt_vf_f32m1_b32(_sum, 0.f, vl);
+            vfloat32m1_t _round = __riscv_vfmv_v_f_f32m1(0.5f, vl);
+            _round = __riscv_vfmerge_vfm_f32m1(_round, -0.5f, _negative, vl);
+            _sum = __riscv_vfadd_vv_f32m1(_sum, _round, vl);
+            vint32m1_t _out32 = __riscv_vfcvt_rtz_x_f_v_i32m1(_sum, vl);
+            _out32 = __riscv_vmax_vx_i32m1(_out32, -127, vl);
+            _out32 = __riscv_vmin_vx_i32m1(_out32, 127, vl);
+            vint16mf2_t _out16 = __riscv_vncvt_x_x_w_i16mf2(_out32, vl);
+            vint8mf4_t _out8 = __riscv_vncvt_x_x_w_i8mf4(_out16, vl);
+            __riscv_vse8_v_i8mf4(outptr + m, _out8, vl);
+
+            m += (int)vl;
+        }
+    }
+#else  // __riscv_vector
     for (int n = 0; n < 4; n++)
     {
         signed char* outptr = outptrs[n] + s;
@@ -34,6 +66,7 @@ static inline void xsmtvdot_store_int8_tile_scalar(const int* acc, const float s
             outptr[m] = xsmtvdot_float2int8(sumfp32 * scale_out);
         }
     }
+#endif // __riscv_vector
 }
 
 static inline void xsmtvdot_store_fp32_tile(const int* acc, const float scale_in[4], const float bias[4], float* const outptrs[4], int s)
@@ -231,7 +264,7 @@ int convolution_1x1_int8_xsmtvdot_forward(const Mat& bottom_blob_int8,
 
             if (use_int8_requantize)
             {
-                xsmtvdot_store_int8_tile_scalar(acc, scale_in, bias, scale_out, outptr_int8, s);
+                xsmtvdot_store_int8_tile(acc, scale_in, bias, scale_out, outptr_int8, s);
             }
             else
             {
@@ -341,7 +374,7 @@ int convolution_1x1_int8_xsmtvdot_forward_4x4k_apanel_experimental(const Mat& bo
 
             if (use_int8_requantize)
             {
-                xsmtvdot_store_int8_tile_scalar(acc, scale_in, bias, scale_out, outptr_int8, s);
+                xsmtvdot_store_int8_tile(acc, scale_in, bias, scale_out, outptr_int8, s);
             }
             else
             {
