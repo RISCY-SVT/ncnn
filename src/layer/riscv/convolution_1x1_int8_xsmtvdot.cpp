@@ -3,10 +3,12 @@
 
 #include "convolution_1x1_int8_xsmtvdot.h"
 
+#include "cpu.h"
 #include "k1x_runtime_feature.h"
 
 #include <cstddef>
 #include <cstdlib>
+#include <algorithm>
 #include <vector>
 
 #if __riscv_vector
@@ -140,19 +142,45 @@ int convolution_1x1_int8_xsmtvdot_create_weight_tm(const Mat& weight_data, Mat& 
 
 int convolution_1x1_int8_xsmtvdot_pipeline_enabled(const Option& opt, int activation_type)
 {
-    return k1x_xsmtvdot_policy_allows(opt, activation_type, opt.num_threads, 1, 1);
+    return convolution_1x1_int8_xsmtvdot_pipeline_mode(opt, activation_type) != CONVOLUTION_1X1_INT8_XSMTVDOT_PATH_NONE;
 }
 
 int convolution_1x1_int8_xsmtvdot_pipeline_mode(const Option& opt, int activation_type)
 {
-    if (!convolution_1x1_int8_xsmtvdot_pipeline_enabled(opt, activation_type))
-        return CONVOLUTION_1X1_INT8_XSMTVDOT_PATH_NONE;
-
     const char* apanel_env = getenv("NCNN_RISCV_INT8_XSMTVDOT_4X4K_APANEL_ENABLE");
     if (apanel_env && apanel_env[0] != '\0' && apanel_env[0] != '0')
-        return CONVOLUTION_1X1_INT8_XSMTVDOT_PATH_4X4K_APANEL_EXPERIMENTAL;
+    {
+        if (opt.num_threads == 1 && k1x_xsmtvdot_policy_allows(opt, activation_type, opt.num_threads, 1, 1))
+            return CONVOLUTION_1X1_INT8_XSMTVDOT_PATH_4X4K_APANEL_EXPERIMENTAL;
 
-    return CONVOLUTION_1X1_INT8_XSMTVDOT_PATH_LEGACY;
+        if (opt.num_threads > 1 && k1x_xsmtvdot_policy_allows_cluster0_workers(opt, activation_type, opt.num_threads, 1, 1))
+            return CONVOLUTION_1X1_INT8_XSMTVDOT_PATH_4X4K_APANEL_CLUSTER0_MT_EXPERIMENTAL;
+
+        return CONVOLUTION_1X1_INT8_XSMTVDOT_PATH_NONE;
+    }
+
+    if (k1x_xsmtvdot_policy_allows(opt, activation_type, opt.num_threads, 1, 1))
+    {
+        return CONVOLUTION_1X1_INT8_XSMTVDOT_PATH_LEGACY;
+    }
+
+    return CONVOLUTION_1X1_INT8_XSMTVDOT_PATH_NONE;
+}
+
+int convolution_1x1_int8_xsmtvdot_h4b_effective_workers(const Option& opt, int size)
+{
+    if (opt.num_threads <= 1 || size <= 0)
+        return 1;
+
+    const int tile_blocks = size / 4;
+    if (tile_blocks <= 1)
+        return 1;
+
+    const int worker_capacity = k1x_xsmtvdot_cluster0_worker_capacity();
+    if (worker_capacity < 2)
+        return 1;
+
+    return std::max(1, std::min(std::min(opt.num_threads, worker_capacity), tile_blocks));
 }
 
 int convolution_1x1_int8_xsmtvdot_legacy_safety_gated(int w, int h, int channels, int num_output)
@@ -289,7 +317,7 @@ int convolution_1x1_int8_xsmtvdot_forward_4x4k_apanel_experimental(const Mat& bo
                                                                    int num_output,
                                                                    const Option& opt)
 {
-    if (opt.num_threads != 1)
+    if (opt.num_threads < 1)
         return 1;
 
     if (activation_type != 0)
@@ -325,62 +353,101 @@ int convolution_1x1_int8_xsmtvdot_forward_4x4k_apanel_experimental(const Mat& bo
         inptrs[q] = bottom_blob_int8.channel(q).row<const signed char>(0);
 
     const int kblocks = channels / 8;
-    std::vector<signed char> apanel((size_t)kblocks * 32);
 
     const float bottom_scale = bottom_blob_int8_scales[0];
     const float scale_out = use_int8_requantize ? top_blob_int8_scales[0] : 0.f;
 
-    for (int s = 0; s < size; s += 4)
+    std::vector<float> scale_in_data(num_output);
+    std::vector<float> bias_data_local(num_output);
+    for (int p = 0; p < num_output; p++)
     {
-        for (int kb = 0; kb < kblocks; kb++)
+        scale_in_data[p] = weight_data_int8_scales[p] != 0 ? 1.f / (bottom_scale * weight_data_int8_scales[p]) : 0.f;
+        bias_data_local[p] = bias_term ? bias_data[p] : 0.f;
+    }
+
+    std::vector<signed char*> outptr_int8_channels;
+    std::vector<float*> outptr_fp32_channels;
+    if (use_int8_requantize)
+    {
+        outptr_int8_channels.resize(num_output);
+        for (int p = 0; p < num_output; p++)
+            outptr_int8_channels[p] = top_blob.channel(p).row<signed char>(0);
+    }
+    else
+    {
+        outptr_fp32_channels.resize(num_output);
+        for (int p = 0; p < num_output; p++)
+            outptr_fp32_channels[p] = top_blob.channel(p).row<float>(0);
+    }
+
+    const int tile_blocks = size / 4;
+    const int effective_workers = convolution_1x1_int8_xsmtvdot_h4b_effective_workers(opt, size);
+
+    if (opt.num_threads > 1 && effective_workers > 1 && get_omp_num_threads() != 1)
+        return 1;
+
+    const signed char* const* inptrs_ptr = inptrs.data();
+    const float* scale_in_ptr = scale_in_data.data();
+    const float* bias_ptr = bias_data_local.data();
+
+    const auto worker_body = [&](int tile_begin, int tile_end) {
+        std::vector<signed char> apanel((size_t)kblocks * 32);
+
+        for (int tile = tile_begin; tile < tile_end; tile++)
         {
-            signed char* ablock = apanel.data() + (size_t)kb * 32;
-            for (int m = 0; m < 4; m++)
+            const int s = tile * 4;
+            for (int kb = 0; kb < kblocks; kb++)
             {
-                for (int k = 0; k < 8; k++)
-                    ablock[m * 8 + k] = inptrs[kb * 8 + k][s + m];
+                signed char* ablock = apanel.data() + (size_t)kb * 32;
+                for (int m = 0; m < 4; m++)
+                {
+                    for (int k = 0; k < 8; k++)
+                        ablock[m * 8 + k] = inptrs_ptr[kb * 8 + k][s + m];
+                }
+            }
+
+            for (int pg = 0; pg < num_output / 4; pg++)
+            {
+                const signed char* bpack_group = weight_data_tm.row<const signed char>(pg);
+                const int p0 = pg * 4;
+                int acc[16];
+
+                ncnn_convolution_1x1_int8_xsmtvdot_4x4_kloop(apanel.data(), bpack_group, kblocks, acc);
+
+                if (use_int8_requantize)
+                {
+                    signed char* outptr_int8[4] = {
+                        outptr_int8_channels[p0],
+                        outptr_int8_channels[p0 + 1],
+                        outptr_int8_channels[p0 + 2],
+                        outptr_int8_channels[p0 + 3]};
+                    xsmtvdot_store_int8_tile(acc, scale_in_ptr + p0, bias_ptr + p0, scale_out, outptr_int8, s);
+                }
+                else
+                {
+                    float* outptr_fp32[4] = {
+                        outptr_fp32_channels[p0],
+                        outptr_fp32_channels[p0 + 1],
+                        outptr_fp32_channels[p0 + 2],
+                        outptr_fp32_channels[p0 + 3]};
+                    xsmtvdot_store_fp32_tile(acc, scale_in_ptr + p0, bias_ptr + p0, outptr_fp32, s);
+                }
             }
         }
+    };
 
-        for (int pg = 0; pg < num_output / 4; pg++)
-        {
-            const signed char* bpack_group = weight_data_tm.row<const signed char>(pg);
-            const int p0 = pg * 4;
-            int acc[16];
+    if (effective_workers <= 1)
+    {
+        worker_body(0, tile_blocks);
+        return 0;
+    }
 
-            ncnn_convolution_1x1_int8_xsmtvdot_4x4_kloop(apanel.data(), bpack_group, kblocks, acc);
-
-            float scale_in[4];
-            float bias[4];
-            for (int n = 0; n < 4; n++)
-            {
-                const int p = p0 + n;
-                scale_in[n] = weight_data_int8_scales[p] != 0 ? 1.f / (bottom_scale * weight_data_int8_scales[p]) : 0.f;
-                bias[n] = bias_term ? bias_data[p] : 0.f;
-            }
-
-            signed char* outptr_int8[4] = {0, 0, 0, 0};
-            float* outptr_fp32[4] = {0, 0, 0, 0};
-            if (use_int8_requantize)
-            {
-                for (int n = 0; n < 4; n++)
-                    outptr_int8[n] = top_blob.channel(p0 + n).row<signed char>(0);
-            }
-            else
-            {
-                for (int n = 0; n < 4; n++)
-                    outptr_fp32[n] = top_blob.channel(p0 + n).row<float>(0);
-            }
-
-            if (use_int8_requantize)
-            {
-                xsmtvdot_store_int8_tile(acc, scale_in, bias, scale_out, outptr_int8, s);
-            }
-            else
-            {
-                xsmtvdot_store_fp32_tile(acc, scale_in, bias, outptr_fp32, s);
-            }
-        }
+    #pragma omp parallel for num_threads(effective_workers) schedule(static)
+    for (int wi = 0; wi < effective_workers; wi++)
+    {
+        const int tile_begin = (int)((long long)tile_blocks * wi / effective_workers);
+        const int tile_end = (int)((long long)tile_blocks * (wi + 1) / effective_workers);
+        worker_body(tile_begin, tile_end);
     }
 
     return 0;

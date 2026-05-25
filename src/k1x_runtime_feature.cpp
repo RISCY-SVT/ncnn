@@ -61,6 +61,7 @@ struct K1xXsmtvdotRuntimeState
     unsigned int failed_or_trap_cluster_mask;
     unsigned int unknown_cluster_mask;
     unsigned int current_policy_flags;
+    int cluster0_worker_capacity;
     int last_reason_code;
 #if defined(__riscv) && defined(__linux__)
     cpu_set_t cluster0_cpu_set;
@@ -180,6 +181,18 @@ static int k1x_cpu_is_in_set(int cpu, const cpu_set_t* set)
     return cpu >= 0 && cpu < CPU_SETSIZE && CPU_ISSET(cpu, set);
 }
 
+static int k1x_count_cpu_set(const cpu_set_t* set)
+{
+    int count = 0;
+    for (int cpu = 0; cpu < CPU_SETSIZE; cpu++)
+    {
+        if (CPU_ISSET(cpu, set))
+            count++;
+    }
+
+    return count;
+}
+
 static int k1x_observed_affinity_is_subset(const cpu_set_t* observed, const cpu_set_t* allowed)
 {
     int any = 0;
@@ -222,6 +235,7 @@ static int k1x_xsmtvdot_canary_ok_locked()
 
 static int k1x_xsmtvdot_current_affinity_cluster0_locked()
 {
+    g_k1x_xsmtvdot_state.cluster0_worker_capacity = 0;
     CPU_ZERO(&g_k1x_xsmtvdot_state.current_affinity_snapshot);
     if (sched_getaffinity(0, sizeof(cpu_set_t), &g_k1x_xsmtvdot_state.current_affinity_snapshot) != 0)
         return 0;
@@ -233,6 +247,7 @@ static int k1x_xsmtvdot_current_affinity_cluster0_locked()
     if (!k1x_cpu_is_in_set(cpu, &g_k1x_xsmtvdot_state.cluster0_cpu_set))
         return 0;
 
+    g_k1x_xsmtvdot_state.cluster0_worker_capacity = k1x_count_cpu_set(&g_k1x_xsmtvdot_state.current_affinity_snapshot);
     return 1;
 }
 #endif
@@ -443,6 +458,46 @@ int k1x_xsmtvdot_policy_allows(const Option& opt, int activation_type, int num_t
     }
 
     return k1x_xsmtvdot_prepare_cluster0_locked();
+}
+
+int k1x_xsmtvdot_policy_allows_cluster0_workers(const Option& opt, int activation_type, int num_threads, int input_elempack, int output_elempack)
+{
+    std::lock_guard<std::mutex> lock(g_k1x_xsmtvdot_lock);
+
+    if (k1x_xsmtvdot_default_dispatch_enabled())
+    {
+        g_k1x_xsmtvdot_state.last_reason_code = K1X_XSMTVDOT_REASON_DEFAULT_DISPATCH_DISABLED;
+        return 0;
+    }
+
+    if (num_threads <= 1 || opt.num_threads != num_threads)
+    {
+        g_k1x_xsmtvdot_state.last_reason_code = K1X_XSMTVDOT_REASON_THREAD_POLICY_DISALLOWED;
+        return 0;
+    }
+
+    if (activation_type != 0 || input_elempack != 1 || output_elempack != 1)
+    {
+        g_k1x_xsmtvdot_state.last_reason_code = K1X_XSMTVDOT_REASON_OPTION_POLICY_DISALLOWED;
+        return 0;
+    }
+
+    if (!k1x_xsmtvdot_prepare_cluster0_locked())
+        return 0;
+
+    if (g_k1x_xsmtvdot_state.cluster0_worker_capacity < 2)
+    {
+        g_k1x_xsmtvdot_state.last_reason_code = K1X_XSMTVDOT_REASON_THREAD_POLICY_DISALLOWED;
+        return 0;
+    }
+
+    return 1;
+}
+
+int k1x_xsmtvdot_cluster0_worker_capacity()
+{
+    std::lock_guard<std::mutex> lock(g_k1x_xsmtvdot_lock);
+    return g_k1x_xsmtvdot_state.cluster0_worker_capacity;
 }
 
 const char* k1x_xsmtvdot_runtime_reason()

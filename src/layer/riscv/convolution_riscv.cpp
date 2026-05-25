@@ -1443,7 +1443,8 @@ int Convolution_riscv::forward(const Mat& bottom_blob, Mat& top_blob, const Opti
             if (out_elempack == 1 && !weight_data_int8_1x1_xsmtvdot_tm.empty())
             {
                 int xsmtvdot_ret = 1;
-                if (weight_data_int8_1x1_xsmtvdot_mode == CONVOLUTION_1X1_INT8_XSMTVDOT_PATH_4X4K_APANEL_EXPERIMENTAL)
+                if (weight_data_int8_1x1_xsmtvdot_mode == CONVOLUTION_1X1_INT8_XSMTVDOT_PATH_4X4K_APANEL_EXPERIMENTAL
+                    || weight_data_int8_1x1_xsmtvdot_mode == CONVOLUTION_1X1_INT8_XSMTVDOT_PATH_4X4K_APANEL_CLUSTER0_MT_EXPERIMENTAL)
                 {
                     xsmtvdot_ret = convolution_1x1_int8_xsmtvdot_forward_4x4k_apanel_experimental(bottom_blob_bordered, top_blob,
                                                                                                   weight_data_int8_1x1_xsmtvdot_tm,
