@@ -29,6 +29,32 @@
 namespace ncnn {
 
 #if NCNN_INT8
+#ifndef NCNN_RISCV_INT8_CONV_DEBUG
+#define NCNN_RISCV_INT8_CONV_DEBUG 0
+#endif
+
+#ifndef NCNN_RISCV_INT8_CONV_STATS
+#define NCNN_RISCV_INT8_CONV_STATS 0
+#endif
+
+#ifndef NCNN_RISCV_INT8_CONV_COVERAGE
+#define NCNN_RISCV_INT8_CONV_COVERAGE 0
+#endif
+
+#ifndef NCNN_RISCV_INT8_CONV_PACKING_AUDIT
+#define NCNN_RISCV_INT8_CONV_PACKING_AUDIT 0
+#endif
+
+#ifndef NCNN_RISCV_INT8_CONV_RUNTIME_ENV
+#define NCNN_RISCV_INT8_CONV_RUNTIME_ENV 0
+#endif
+
+#if NCNN_RISCV_INT8_CONV_RUNTIME_ENV
+#define NCNN_RISCV_INT8_GETENV_FLAG(name) ([]() -> int { const char* env = getenv(name); return (env && env[0] != '\0' && env[0] != '0') ? 1 : 0; }())
+#else
+#define NCNN_RISCV_INT8_GETENV_FLAG(name) 0
+#endif
+
 struct riscv_int8_coverage_counters_t
 {
     std::atomic<unsigned long long> conv_int8_pack1_1x1_fast_count{0};
@@ -71,16 +97,17 @@ static riscv_int8_coverage_counters_t g_riscv_int8_coverage_counters;
 
 static inline int riscv_int8_coverage_enabled()
 {
-    static const int g_enabled = []() -> int
-    {
-        const char* env = getenv("NCNN_RISCV_INT8_COVERAGE");
-        return (env && env[0] != '\0' && env[0] != '0') ? 1 : 0;
-    }();
+#if NCNN_RISCV_INT8_CONV_COVERAGE
+    static const int g_enabled = NCNN_RISCV_INT8_GETENV_FLAG("NCNN_RISCV_INT8_COVERAGE");
     return g_enabled;
+#else
+    return 0;
+#endif
 }
 
 static void riscv_int8_coverage_dump()
 {
+#if NCNN_RISCV_INT8_CONV_COVERAGE
     if (!riscv_int8_coverage_enabled())
         return;
 
@@ -126,12 +153,15 @@ static void riscv_int8_coverage_dump()
               load(g_riscv_int8_coverage_counters.fallback_reason_disable_1x1),
               load(g_riscv_int8_coverage_counters.fallback_reason_disable_3x3s1),
               load(g_riscv_int8_coverage_counters.fallback_reason_disable_3x3s2));
+#endif
 }
 
 static inline void riscv_int8_coverage_register_atexit_once()
 {
+#if NCNN_RISCV_INT8_CONV_COVERAGE
     static std::once_flag g_coverage_once;
     std::call_once(g_coverage_once, []() { atexit(riscv_int8_coverage_dump); });
+#endif
 }
 
 struct riscv_int8_packing_audit_key_t
@@ -159,16 +189,17 @@ static std::map<riscv_int8_packing_audit_key_t, unsigned long long> g_riscv_int8
 
 static inline int riscv_int8_packing_audit_enabled()
 {
-    static const int g_enabled = []() -> int
-    {
-        const char* env = getenv("NCNN_RISCV_INT8_PACKING_AUDIT");
-        return (env && env[0] != '\0' && env[0] != '0') ? 1 : 0;
-    }();
+#if NCNN_RISCV_INT8_CONV_PACKING_AUDIT
+    static const int g_enabled = NCNN_RISCV_INT8_GETENV_FLAG("NCNN_RISCV_INT8_PACKING_AUDIT");
     return g_enabled;
+#else
+    return 0;
+#endif
 }
 
 static inline void riscv_int8_packing_audit_record(int kernel_w, int kernel_h, int stride_w, int stride_h, int dilation_w, int dilation_h, int in_elempack, int bottom_scalar_elemsize, int requested_out_elempack, int activation_type)
 {
+#if NCNN_RISCV_INT8_CONV_PACKING_AUDIT
     if (!riscv_int8_packing_audit_enabled())
         return;
 
@@ -186,10 +217,23 @@ static inline void riscv_int8_packing_audit_record(int kernel_w, int kernel_h, i
 
     std::lock_guard<std::mutex> lock(g_riscv_int8_packing_audit_mutex);
     g_riscv_int8_packing_audit_hist[k] += 1;
+#else
+    (void)kernel_w;
+    (void)kernel_h;
+    (void)stride_w;
+    (void)stride_h;
+    (void)dilation_w;
+    (void)dilation_h;
+    (void)in_elempack;
+    (void)bottom_scalar_elemsize;
+    (void)requested_out_elempack;
+    (void)activation_type;
+#endif
 }
 
 static void riscv_int8_packing_audit_dump()
 {
+#if NCNN_RISCV_INT8_CONV_PACKING_AUDIT
     if (!riscv_int8_packing_audit_enabled())
         return;
 
@@ -224,12 +268,15 @@ static void riscv_int8_packing_audit_dump()
                   k.in_elempack, k.bottom_scalar_elemsize,
                   k.requested_out_elempack, k.activation_type);
     }
+#endif
 }
 
 static inline void riscv_int8_packing_audit_register_atexit_once()
 {
+#if NCNN_RISCV_INT8_CONV_PACKING_AUDIT
     static std::once_flag g_packing_audit_once;
     std::call_once(g_packing_audit_once, []() { atexit(riscv_int8_packing_audit_dump); });
+#endif
 }
 
 static inline signed char float2int8_rvv(float v)
@@ -2483,6 +2530,111 @@ PACKN_3X3S1_FALLBACK:
                     g_riscv_int8_coverage_counters.conv_int8_packout_used_count.fetch_add(1, std::memory_order_relaxed);
                 else if (packout_candidate)
                     g_riscv_int8_coverage_counters.conv_int8_packout_forced_pack1_count.fetch_add(1, std::memory_order_relaxed);
+            }
+
+            const bool use_2oc_areuse = !use_int8_requantize && out_elempack > 1 && (out_elempack % 2) == 0 && activation_type == 0 && (num_output % 2) == 0;
+            if (use_2oc_areuse)
+            {
+                #pragma omp parallel num_threads(opt.num_threads)
+                {
+                    int* sums0 = riscv_get_sums_buffer_slot((size_t)vlenb, 0);
+                    int* sums1 = riscv_get_sums_buffer_slot((size_t)vlenb, 1);
+
+                    #pragma omp for schedule(static)
+                    for (int p = 0; p < num_output; p += 2)
+                    {
+                        const int p1 = p + 1;
+                        const int out_channel_index0 = p / out_elempack;
+                        const int out_channel_index1 = p1 / out_elempack;
+                        const int out_lane0 = p % out_elempack;
+                        const int out_lane1 = p1 % out_elempack;
+                        Mat outc0 = top_blob.channel(out_channel_index0);
+                        Mat outc1 = top_blob.channel(out_channel_index1);
+                        const signed char* kptr0 = (const signed char*)weight_data + channels * p * 9;
+                        const signed char* kptr1 = (const signed char*)weight_data + channels * p1 * 9;
+
+                        float scale_in0 = 0.f;
+                        if (weight_data_int8_scales[p] != 0)
+                            scale_in0 = 1.f / (bottom_blob_int8_scales[0] * weight_data_int8_scales[p]);
+                        float scale_in1 = 0.f;
+                        if (weight_data_int8_scales[p1] != 0)
+                            scale_in1 = 1.f / (bottom_blob_int8_scales[0] * weight_data_int8_scales[p1]);
+
+                        float bias0 = bias_term ? bias_data[p] : 0.f;
+                        float bias1 = bias_term ? bias_data[p1] : 0.f;
+                        const int force_fma = riscv_int8_conv_force_fma();
+                        const int no_fma = riscv_int8_conv_no_fma();
+
+                        for (int i = 0; i < outh; i++)
+                        {
+                            const int in_y = i * stride_h;
+                            float* outptr0 = outc0.row<float>(i) + out_lane0;
+                            float* outptr1 = outc1.row<float>(i) + out_lane1;
+
+                            for (int j = 0; j < outw; )
+                            {
+                                const int remain = outw - j;
+                                const int in_x = j * 2;
+                                int max_pairs = 0;
+                                if (!disable_rvv_int8_s2_vlseg2 && in_x + 2 < w)
+                                    max_pairs = (w - (in_x + 2)) / 2;
+                                int use_s2_vlseg2 = max_pairs > 0;
+                                size_t vl = use_s2_vlseg2 ? __riscv_vsetvl_e8m1((size_t)std::min(remain, max_pairs)) : __riscv_vsetvl_e8m1((size_t)remain);
+                                if (vl == 0)
+                                {
+                                    use_s2_vlseg2 = 0;
+                                    vl = __riscv_vsetvl_e8m1((size_t)remain);
+                                }
+
+                                vint32m4_t _sum0 = __riscv_vmv_v_x_i32m4(0, vl);
+                                vint32m4_t _sum1 = __riscv_vmv_v_x_i32m4(0, vl);
+
+#define NCNN_RVV_INT8_3X3S2_2OC_ACC(rowptr, offset, kidx)                    \
+                                do                                             \
+                                {                                              \
+                                    vint8m1_t _r = riscv_int8_load_stride2_i8m1((rowptr) + (offset), vl, use_s2_vlseg2, coverage_enabled); \
+                                    vint16m2_t _r16 = __riscv_vsext_vf2_i16m2(_r, vl); \
+                                    _sum0 = __riscv_vwmacc_vx_i32m4(_sum0, (short)kptr0_q[(kidx)], _r16, vl); \
+                                    _sum1 = __riscv_vwmacc_vx_i32m4(_sum1, (short)kptr1_q[(kidx)], _r16, vl); \
+                                } while (0)
+
+                                for (int q = 0; q < channels; q++)
+                                {
+                                    const signed char* kptr0_q = kptr0 + q * 9;
+                                    const signed char* kptr1_q = kptr1 + q * 9;
+
+                                    const signed char* r0 = bottom_blob_bordered.channel(q).row<signed char>(in_y + 0) + j * 2;
+                                    const signed char* r1 = bottom_blob_bordered.channel(q).row<signed char>(in_y + 1) + j * 2;
+                                    const signed char* r2 = bottom_blob_bordered.channel(q).row<signed char>(in_y + 2) + j * 2;
+
+                                    NCNN_RVV_INT8_3X3S2_2OC_ACC(r0, 0, 0);
+                                    NCNN_RVV_INT8_3X3S2_2OC_ACC(r0, 1, 1);
+                                    NCNN_RVV_INT8_3X3S2_2OC_ACC(r0, 2, 2);
+                                    NCNN_RVV_INT8_3X3S2_2OC_ACC(r1, 0, 3);
+                                    NCNN_RVV_INT8_3X3S2_2OC_ACC(r1, 1, 4);
+                                    NCNN_RVV_INT8_3X3S2_2OC_ACC(r1, 2, 5);
+                                    NCNN_RVV_INT8_3X3S2_2OC_ACC(r2, 0, 6);
+                                    NCNN_RVV_INT8_3X3S2_2OC_ACC(r2, 1, 7);
+                                    NCNN_RVV_INT8_3X3S2_2OC_ACC(r2, 2, 8);
+                                }
+
+#undef NCNN_RVV_INT8_3X3S2_2OC_ACC
+
+                                __riscv_vse32_v_i32m4(sums0, _sum0, vl);
+                                __riscv_vse32_v_i32m4(sums1, _sum1, vl);
+
+                                riscv_int8_store_fp32_from_sums(outptr0 + (size_t)j * out_elempack, sums0, (int)vl, scale_in0, bias0, bias_term, force_fma, no_fma, activation_type, activation_params, out_elempack, disable_rvv_int8_post_vrvv, coverage_enabled);
+                                riscv_int8_store_fp32_from_sums(outptr1 + (size_t)j * out_elempack, sums1, (int)vl, scale_in1, bias1, bias_term, force_fma, no_fma, activation_type, activation_params, out_elempack, disable_rvv_int8_post_vrvv, coverage_enabled);
+
+                                j += vl;
+                            }
+                        }
+                    }
+                }
+
+                if (coverage_enabled)
+                    g_riscv_int8_coverage_counters.conv_int8_pack1_3x3s2_fast_count.fetch_add(1, std::memory_order_relaxed);
+                return 0;
             }
 
             #pragma omp parallel num_threads(opt.num_threads)
