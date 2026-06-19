@@ -9,8 +9,35 @@
 
 namespace ncnn {
 
+#if defined(__GNUC__) && !defined(__clang__)
+__attribute__((noinline, optimize("O0")))
+#endif
+static void clear_mat_scalar(Mat& m)
+{
+    m.data = 0;
+    m.refcount = 0;
+    m.elemsize = 0;
+    m.elempack = 0;
+    m.allocator = 0;
+    m.dims = 0;
+    m.w = 0;
+    m.h = 0;
+    m.d = 0;
+    m.c = 0;
+    m.cstep = 0;
+}
+
 Convolution::Convolution()
 {
+    clear_mat_scalar(activation_params);
+    clear_mat_scalar(weight_data);
+    clear_mat_scalar(bias_data);
+#if NCNN_INT8
+    clear_mat_scalar(weight_data_int8_scales);
+    clear_mat_scalar(bottom_blob_int8_scales);
+    clear_mat_scalar(top_blob_int8_scales);
+#endif
+
     one_blob_only = true;
     support_inplace = false;
 }
